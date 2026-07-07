@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+
+# OS
+.DS_Store
+
+# Local data/model artifacts (this script writes these if run from the repo root)
+*.csv
+*.joblib
+*.json
+
+# Outdated code
+SofaScore_Scraper.ipynb
+Expected_Lineup.py
+Expected_Lineup_Temp.py
+.ipynb_checkpoints
+
+
+# Context Files
+Pre-Match Report Mockup V2
+Example Match Data - Incomplete
+Example Match Data

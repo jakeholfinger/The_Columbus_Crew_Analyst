@@ -756,10 +756,10 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
 # Right-sided positions (DR, MR, RW) are at high x; left-sided (DL, ML, LW) at low x.
 POSITION_COORDINATES = {
     'GK':  (50,  6),
-    'DR':  (88, 35), 'DCR': (67, 25), 'DC':  (50, 25), 'DCL': (33, 25), 'DL':  (12, 35),
-    'DMR': (67, 38), 'DM':  (50, 38), 'DML': (33, 38),
-    'MR':  (88, 51), 'MCR': (67, 51), 'MC':  (50, 51), 'MCL': (33, 51), 'ML':  (12, 51),
-    'RW':  (88, 68), 'AMR': (67, 68), 'AM':  (50, 64), 'AML': (33, 68), 'LW':  (12, 68),
+    'DR':  (88, 32), 'DCR': (67, 23), 'DC':  (50, 23), 'DCL': (33, 23), 'DL':  (12, 32),
+    'DMR': (67, 43), 'DM':  (50, 43), 'DML': (33, 43),
+    'MR':  (88, 55), 'MCR': (67, 55), 'MC':  (50, 55), 'MCL': (33, 55), 'ML':  (12, 55),
+    'RW':  (88, 68), 'AMR': (67, 68), 'AM':  (50, 68), 'AML': (33, 68), 'LW':  (12, 68),
     'STR': (67, 82), 'ST':  (50, 82), 'STL': (33, 82)
 }
 #%%
