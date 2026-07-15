@@ -68,6 +68,8 @@ def scrapeNextMatches(teamID, targetDateTimestamp):
     while not done:
         apiURL = f'https://www.sofascore.com/api/v1/team/{teamID}/events/next/{count}'
         data = getURLData(apiURL)
+        if data is None:
+            break
         events = data.get('events', [])
 
         for match in events:
@@ -98,7 +100,8 @@ def scrapeNextMatches(teamID, targetDateTimestamp):
 
     if matchIndex is None:
         print(f'No future match found for team {teamID} after {targetDateTimestamp}')
-        return pd.DataFrame(), {}
+        # Must match the arity of the normal return (futureDF, missingPlayers, targetMatchID)
+        return pd.DataFrame(), {}, None
 
     # Scrape missing players for each match
     matchesMissingPlayers = []
@@ -196,6 +199,22 @@ def normalizeFormation(formation):
             pass
     return s
 #%%
+KNOWN_FORMATIONS = [
+    '4-3-3',
+    '4-4-2',
+    '4-2-3-1',
+    '4-1-3-2',
+    '4-4-1-1',
+    '4-3-1-2',
+    '4-1-4-1',
+    '3-4-2-1',
+    '3-4-3',
+    '3-4-1-2',
+    '3-5-2',
+    '5-3-2',
+    '5-4-1'
+]
+#%%
 def getFormationSlots(formation):
     if formation == '4-3-3':
         return ['GK', 'DR', 'DCR', 'DCL', 'DL', 'MCR', 'MC', 'MCL', 'RW', 'ST', 'LW']
@@ -257,7 +276,6 @@ def getData(leagues, team, date):
     playerStatisticsList = []
     subsList = []
     formationsList = []
-    playerHeatmapsList = []
 
     month = int(date.split('-')[0])
     day = int(date.split('-')[1])
@@ -268,29 +286,44 @@ def getData(leagues, team, date):
     currentMonth = today.month
     currentDay = today.day
 
-    # Read data into lists of dataframes
+    # Read data into lists of dataframes. Files are loaded per-folder so the lists
+    # below always stay aligned match-for-match — previously each list was appended
+    # independently, so one missing CSV in any folder silently misaligned/dropped
+    # matches in the zip further down.
+    requiredFiles = ['Match_Attributes.csv', 'Missing_Players.csv', 'Player_Statistics.csv', 'Subs.csv', 'Formations.csv']
+    seenMatchIDs = set()
     for league in leagues:
         teamPath = f'/Users/jakeholfinger/Desktop/CC Analyst/Data/SofaScore_Data/{year}_Data/{league.replace(' ', '_')}_Data/{team.replace(' ', '_')}_Data'
+        if not os.path.exists(teamPath):
+            print(f'No data folder found at {teamPath}, skipping.')
+            continue
         for matchFolder in GetFiles(teamPath):
             matchPath = os.path.join(teamPath, matchFolder)
-            for file in GetFiles(matchPath):
-                filePath = os.path.join(matchPath, file)
-                if file == 'Match_Attributes.csv':
-                    matchAttributesList.append(pd.read_csv(filePath))
-                elif file == 'Missing_Players.csv':
-                    missingPlayersList.append(pd.read_csv(filePath))
-                elif file == 'Player_Statistics.csv':
-                    playerStatisticsList.append(pd.read_csv(filePath))
-                elif file == 'Subs.csv':
-                    subsList.append(pd.read_csv(filePath))
-                elif file == 'Formations.csv':
-                    formationsList.append(pd.read_csv(filePath))
-                elif file == 'Player_Heatmaps.csv':
-                    playerHeatmapsList.append(pd.read_csv(filePath))
+            if not os.path.isdir(matchPath):
+                continue
+            matchFiles = GetFiles(matchPath)
+            missingFiles = [f for f in requiredFiles if f not in matchFiles]
+            if missingFiles:
+                print(f'Skipping {matchFolder}: missing {missingFiles}')
+                continue
+            matchAttributes = pd.read_csv(os.path.join(matchPath, 'Match_Attributes.csv'))
+            # The same match can exist under two folder names (folder dates follow the
+            # machine's timezone at scrape time) — loading it twice would double-count
+            # the match in every feature
+            matchID = matchAttributes['id'].iloc[0]
+            if matchID in seenMatchIDs:
+                print(f'Skipping {matchFolder}: duplicate of an already-loaded match (ID {matchID})')
+                continue
+            seenMatchIDs.add(matchID)
+            matchAttributesList.append(matchAttributes)
+            missingPlayersList.append(pd.read_csv(os.path.join(matchPath, 'Missing_Players.csv')))
+            playerStatisticsList.append(pd.read_csv(os.path.join(matchPath, 'Player_Statistics.csv')))
+            subsList.append(pd.read_csv(os.path.join(matchPath, 'Subs.csv')))
+            formationsList.append(pd.read_csv(os.path.join(matchPath, 'Formations.csv')))
 
     # Add relevant columns to playerStatistics dataframes
     index = 0
-    for matchAttributes, missingPlayers, playerStatistics, subs, formations, playerHeatmaps in zip(matchAttributesList, missingPlayersList, playerStatisticsList, subsList, formationsList, playerHeatmapsList):
+    for matchAttributes, missingPlayers, playerStatistics, subs, formations in zip(matchAttributesList, missingPlayersList, playerStatisticsList, subsList, formationsList):
         # Add relevant columns in other dataframes to playerStatistics
         if 'ID' not in missingPlayers.columns or 'Availability' not in missingPlayers.columns:
             missingPlayers = pd.DataFrame(columns=['ID', 'Availability'])
@@ -358,6 +391,11 @@ def getData(leagues, team, date):
     predictedMatchIDs = [targetMatchID] if targetMatchID else []
 
     mainDF = pd.concat([mainDF, futureDF], ignore_index=True)
+
+    # Detailed Positions only comes from future (scraped squad) rows — create the column
+    # when no future match was found so the steps below don't KeyError
+    if 'Detailed Positions' not in mainDF.columns:
+        mainDF['Detailed Positions'] = np.nan
 
     # Detailed Positions is player-level; propagate from future rows to historical rows
     dpMap = (mainDF[mainDF['Detailed Positions'].apply(lambda v: isinstance(v, list))].drop_duplicates('ID').set_index('ID')['Detailed Positions'])
@@ -457,6 +495,12 @@ def computeChanges(lineups):
 
     return pd.Series(changes, index=lineups.index)
 #%%
+def collapseEquivalentFormations(formationSeries):
+    '''3-4-2-1 and 3-4-3 use identical slot layouts (see getFormationSlots), so treat
+    them as one formation when counting occurrences for predictFormation's mode — otherwise
+    the vote for that shape gets split across two labels and understates its true frequency.'''
+    return formationSeries.replace('3-4-2-1', '3-4-3')
+
 def predictFormation(df, formationCol='Formation', groupByCol=None):
     '''Returns {matchID: predicted_formation} using only prior data (no leakage).
     formationCol: 'Formation' for team formation, 'Opposition Formation' for opposition.
@@ -477,18 +521,18 @@ def predictFormation(df, formationCol='Formation', groupByCol=None):
             priorFormations = groupPrior if not groupPrior.empty else priorRows[formationCol].dropna()
         else:
             priorFormations = priorRows[formationCol].dropna()
-        predictions[row['Match ID']] = (normalizeFormation(priorFormations.mode().iloc[0]) if not priorFormations.empty else '4-3-3')
+        predictions[row['Match ID']] = (normalizeFormation(collapseEquivalentFormations(priorFormations).mode().iloc[0]) if not priorFormations.empty else '4-3-3')
 
     # Future matches: use all historical data (opponent-specific if available)
     allHistoricalFormations = historicalDF[formationCol].dropna()
-    globalFallback = (normalizeFormation(allHistoricalFormations.mode().iloc[0]) if not allHistoricalFormations.empty else '4-3-3')
+    globalFallback = (normalizeFormation(collapseEquivalentFormations(allHistoricalFormations).mode().iloc[0]) if not allHistoricalFormations.empty else '4-3-3')
     for matchID in df.loc[df['Is Future Match'] == True, 'Match ID'].unique():
         if groupByCol:
             futureMask = (df['Is Future Match'] == True) & (df['Match ID'] == matchID)
             groupVal   = df.loc[futureMask, groupByCol].iloc[0] if futureMask.any() else None
             if groupVal is not None:
                 groupPrior = historicalDF[historicalDF[groupByCol] == groupVal][formationCol].dropna()
-                predictions[matchID] = (normalizeFormation(groupPrior.mode().iloc[0]) if not groupPrior.empty else globalFallback)
+                predictions[matchID] = (normalizeFormation(collapseEquivalentFormations(groupPrior).mode().iloc[0]) if not groupPrior.empty else globalFallback)
             else:
                 predictions[matchID] = globalFallback
         else:
@@ -547,8 +591,18 @@ def engineerFeatures(df):
     matchDF = df[['Match ID', 'Days Since Season Start']].drop_duplicates().sort_values('Days Since Season Start').reset_index(drop=True)
     matchDF['Global Match Number'] = range(len(matchDF))
     df = df.merge(matchDF[['Match ID', 'Global Match Number']], on='Match ID', how='left')
-    df['Consecutive Played'] = df['Played'].where(historicalMask).groupby([df['ID'], df.where(historicalMask).groupby('ID')['Played'].transform(lambda x: x.eq(0).cumsum())]).cumsum()
-    df['Consecutive Started'] = df['Started'].where(historicalMask).groupby([df['ID'], df.where(historicalMask).groupby('ID')['Started'].transform(lambda x: x.eq(0).cumsum())]).cumsum()
+    # Streak cumsums include the current match, which leaks the label (Started row ⟺
+    # Consecutive Started >= 1). shift(1) per player gives the streak ENTERING the match;
+    # ffill per player carries the latest value onto future rows (they were NaN before).
+    # The mask must be recomputed here: the merge above reset df's index, so the
+    # historicalMask from the top of the function no longer aligns row-for-row.
+    postMergeHistoricalMask = ~df['Is Future Match']
+    playedStreakIdx = df.where(postMergeHistoricalMask).groupby('ID')['Played'].transform(lambda x: x.eq(0).cumsum())
+    startedStreakIdx = df.where(postMergeHistoricalMask).groupby('ID')['Started'].transform(lambda x: x.eq(0).cumsum())
+    consecutivePlayed = df['Played'].where(postMergeHistoricalMask).groupby([df['ID'], playedStreakIdx]).cumsum()
+    consecutiveStarted = df['Started'].where(postMergeHistoricalMask).groupby([df['ID'], startedStreakIdx]).cumsum()
+    df['Consecutive Played'] = consecutivePlayed.groupby(df['ID']).shift(1).groupby(df['ID']).ffill().fillna(0)
+    df['Consecutive Started'] = consecutiveStarted.groupby(df['ID']).shift(1).groupby(df['ID']).ffill().fillna(0)
     df['Matches Since In Squad'] = df.groupby('ID')['Global Match Number'].diff().sub(1).clip(lower=0).fillna(0).astype(int)
 
     # Match Context
@@ -569,7 +623,12 @@ def engineerFeatures(df):
     lineups['Lineup Changes'] = computeChanges(lineups)
     #df = df.merge(lineups[['Match ID', 'Lineup Changes']], how='left', on='Match ID')
 
-    matchLineups = lineups[['Match ID', 'Days Since Season Start', 'Lineup Changes']].sort_values('Days Since Season Start')
+    # Build the match-level frame from ALL matches (future ones have no starters, so no
+    # 'Lineup Changes' value). The shifted EWMs then carry the latest historical value
+    # onto the future/target rows — previously the merge left these features NaN exactly
+    # on the rows being predicted.
+    matchLineups = df[['Match ID', 'Days Since Season Start']].drop_duplicates('Match ID').sort_values('Days Since Season Start')
+    matchLineups = matchLineups.merge(lineups[['Match ID', 'Lineup Changes']], on='Match ID', how='left')
     for alpha, columnName in zip([0.25, 0.05], ['Lineup Changes Form', 'Lineup Changes Overall']):
         matchLineups[columnName] = matchLineups['Lineup Changes'].shift().ewm(alpha=alpha, adjust=False).mean()
 
@@ -598,6 +657,91 @@ def engineerFeatures(df):
 
     return df
 
+#%%
+# For a player with zero historical rows, every rolling/tenure feature the classifier
+# relies on collapses to NaN, and the model extrapolates from the ONLY training rows
+# that share that pattern: other players' first-ever squad appearance. That doesn't
+# generalize to the full club roster (most of whom would never be named to a matchday
+# squad at all), producing wildly inflated raw probabilities.
+#
+# These tables replace the raw model output for such players with a value-percentile
+# prior derived from real debut outcomes, pooled across 389 genuine mid-season squad
+# debuts (and 301 bench debuts specifically) spanning 104 team-seasons across 5
+# competitions in the 2026 season (MLS, US Open Cup, CONCACAF Champions Cup, USL
+# Championship, USL League One) — chosen for variety in resource level and league
+# structure so the curve isn't overfit to MLS's roster rules, since this pipeline can
+# run for any team/league. "Debut" = a player's first appearance in a team's data,
+# excluding their first-ever scraped match (which just means "first data we have", not
+# an observable debut). Percentile is computed the same way as the value-floor filters:
+# fraction of the team's own reference population with a lower value, so it's relative
+# to squad hierarchy rather than absolute transfer fees — that's what should make it
+# reasonably portable to leagues at different wage scales, though the exact rates were
+# only validated against domestic US/CONCACAF competitions.
+#
+# Caveat: these rates are conditioned on the player actually being selected for that
+# debut match — we have no data on players who are NEVER selected (they have zero
+# rows, by definition), so the true rate for a permanent fringe/reserve player is
+# likely somewhat lower than shown here. The existing value-floor filters already
+# screen out the least plausible candidates before this prior is ever applied, which
+# narrows that gap but doesn't close it — treat these as a reasonable, not exact,
+# estimate.
+NO_HISTORY_STARTS_PRIOR = [(0.2, 0.24), (0.4, 0.33), (0.6, 0.35), (0.8, 0.38), (1.01, 0.42)]
+
+# Subs use a MULTIPLIER (applied to the current pool's own median raw score for
+# established candidates) rather than an absolute probability. Unlike starts, the subs
+# model's raw output is shared-budget-normalized across however many candidates survive
+# filtering — when scoring the full club roster (as opposed to a realistic ~7-9 man
+# matchday bench), that pool is much larger than what the training data's per-match
+# rates reflect, which mechanically compresses every established candidate's raw score
+# well below the real-world ~50-58% sub-in rate found in the same debut data. Plugging
+# an absolute empirical probability in here would dominate the shared budget exactly
+# like the original NaN-collapse bug did, just via a better-justified number. The
+# multiplier keeps the correction self-calibrating to whatever scale this pool's other
+# candidates actually land on. Values are the isotonic-fit rate at each percentile
+# divided by the overall mean rate (0.575), with the top bucket smoothed down from the
+# fitted 1.74x (a single highest-percentile data point) to the more robust ~1.3-1.4x
+# implied by the wider top-quintile average.
+NO_HISTORY_SUBS_MULTIPLIER = [(0.2, 0.85), (0.4, 1.10), (0.6, 1.10), (0.8, 1.25), (1.01, 1.40)]
+
+def valuePercentileToPrior(percentile, priorTable):
+    '''Maps a 0-1 value percentile to a value via a piecewise lookup table of
+    (upper_percentile_bound, value) pairs, ordered ascending by bound.'''
+    for upperBound, val in priorTable:
+        if percentile <= upperBound:
+            return val
+    return priorTable[-1][1]
+
+def parseDetailedPositions(value):
+    '''Returns a set of slot-like strings from a Detailed Positions cell (a list, a
+    stringified list from CSV round-tripping, or a list of {'position': ...} dicts).'''
+    import ast
+    if isinstance(value, str):
+        try:
+            value = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            value = []
+    if not isinstance(value, list):
+        return set()
+    return {(item.get('position') if isinstance(item, dict) else item) for item in value} - {None}
+
+def weightedValuePercentile(candidateValue, candidatePosition, candidateDetailedPositions, referenceDF,
+                             samePositionWeight=1.5, sameSlotWeight=3.0):
+    '''Weighted empirical percentile of candidateValue within referenceDF['Market Value
+    Log']. referenceDF needs 'Market Value Log', 'Position', 'Detailed Positions'
+    columns. Players sharing the candidate's broad Position count more than an
+    unrelated player, and players overlapping on Detailed Positions (a stand-in for
+    "primary slot" — zero-history candidates have no Formation Slot history to compare
+    against) count more still. Weights are a judgment call, not fit from data; everyone
+    else keeps weight 1.0, so this is a smooth adjustment on top of the plain
+    whole-squad percentile rather than a hard filter.'''
+    candidateSlots = parseDetailedPositions(candidateDetailedPositions)
+    refSlotSets = referenceDF['Detailed Positions'].apply(parseDetailedPositions)
+    sameSlot = refSlotSets.apply(lambda s: bool(candidateSlots & s)) if candidateSlots else pd.Series(False, index=referenceDF.index)
+    samePosition = referenceDF['Position'] == candidatePosition
+
+    weights = np.where(sameSlot, sameSlotWeight, np.where(samePosition, samePositionWeight, 1.0))
+    lower = (referenceDF['Market Value Log'] < candidateValue).to_numpy()
+    return float((weights * lower).sum() / weights.sum())
 #%%
 def computeStartingProbabilities(df, predictedMatchIDs, verbose=True):
 
@@ -632,6 +776,44 @@ def computeStartingProbabilities(df, predictedMatchIDs, verbose=True):
     
     # Remove the last match as its now unneeded
     testingDF = testingDF[testingDF['Match ID'] == predictedMatchIDs[0]].copy()
+
+    # Exclude candidates with no historical matchday-squad appearance UNLESS their
+    # market value suggests a notable new signing rather than a fringe/reserve player.
+    # Every rolling/tenure feature collapses to NaN or a misleadingly "clean" 0 for a
+    # player with zero history (e.g. Tenure Matches In Squad = 0, Consecutive Started =
+    # 0), which XGBoost can read as "fresh, no red flags" — a blanket exclusion (as
+    # computeSubstitutionProbabilities already does) would fix that but also wrongly
+    # drop a marquee transfer who hasn't played for the team yet but is clearly
+    # starter-quality. Comparing against the value floor of players who've actually
+    # started lets a big signing through while still filtering the reserve-team tail.
+    historicalIDs = set(df.loc[df['Is Future Match'] == False, 'ID'])
+    startedMarketValues = modelDF.loc[(modelDF['Is Future Match'] == False) & (modelDF['Started'] == 1), 'Market Value Log']
+    if len(startedMarketValues) >= 5:
+        valueFloor = startedMarketValues.quantile(0.25)
+        noHistoryLowValue = (~testingDF['ID'].isin(historicalIDs)) & (testingDF['Market Value Log'] < valueFloor)
+        excluded = testingDF.loc[noHistoryLowValue, 'Player Name'].tolist()
+        if excluded and verbose:
+            print(f'Excluding no-history, below-value-floor candidates: {excluded}')
+        testingDF = testingDF[~noHistoryLowValue].copy()
+
+    # For no-history survivors, precompute their (position-weighted) value percentile
+    # now (indices still match testingDF/testPlayers below) — used after the model fits
+    # to replace their raw prediction with NO_HISTORY_STARTS_PRIOR (see module-level
+    # comment above). Weighting toward same-position/same-slot reference players
+    # (rather than a flat whole-squad percentile) compares a candidate against players
+    # in a comparable role, since transfer valuations skew systematically by position.
+    noHistoryMask = ~testingDF['ID'].isin(historicalIDs)
+    if noHistoryMask.any() and len(startedMarketValues) >= 5:
+        startedReferenceDF = df.loc[startedMarketValues.index, ['Market Value Log', 'Position', 'Detailed Positions']]
+        candidateDetailedPositions = df.loc[testingDF.index, 'Detailed Positions']
+        noHistoryValuePercentiles = testingDF.loc[noHistoryMask].apply(
+            lambda row: weightedValuePercentile(
+                row['Market Value Log'], row['Position'], candidateDetailedPositions.loc[row.name], startedReferenceDF
+            ), axis=1
+        )
+    else:
+        noHistoryValuePercentiles = pd.Series(dtype=float)
+
     testPlayers = testingDF[['Player Name', 'ID']].copy()
 
     # Split into x and y
@@ -709,6 +891,13 @@ def computeStartingProbabilities(df, predictedMatchIDs, verbose=True):
     starterProbabilities = finalModel.predict_proba(xTest)[:, 1]
 
     testPlayers['Starter Probability'] = starterProbabilities
+
+    if not noHistoryValuePercentiles.empty:
+        priorSeries = noHistoryValuePercentiles.apply(lambda p: valuePercentileToPrior(p, NO_HISTORY_STARTS_PRIOR))
+        testPlayers.loc[priorSeries.index, 'Starter Probability'] = priorSeries
+        if verbose:
+            overriddenNames = testingDF.loc[priorSeries.index, 'Player Name'].tolist()
+            print(f'Using value-percentile prior (not raw model output) for: {overriddenNames}')
 
     if verbose:
         print('Test Player Probabilities:')
@@ -840,7 +1029,7 @@ def predictLineup(mainDF, probsDF, formation, team, opposition, home, verbose=Tr
 
     # Objective: maximize starter probability weighted by position tier.
     # Weights are small enough to only break ties, not override probability differences.
-    TIER_WEIGHTS = {'primary': 1.0, 'secondary': 0.85, 'tertiary': 0.60}
+    TIER_WEIGHTS = {'primary': 1.0, 'secondary': 0.80, 'tertiary': 0.50}
     prob += (
         lpSum(TIER_WEIGHTS['primary']   * probsDF.loc[p, 'Starter Probability'] * assign[p, s] for p in players for s in primaryEligibility[p]   if (p, s) in assign) +
         lpSum(TIER_WEIGHTS['secondary'] * probsDF.loc[p, 'Starter Probability'] * assign[p, s] for p in players for s in secondaryEligibility[p] if (p, s) in assign) +
@@ -1186,25 +1375,66 @@ def computeSubstitutionProbabilities(df, predictedMatchIDs, predictedLineup, ver
     futureMask = (df['Is Future Match'] == True) & (df['Match ID'] == predictedMatchIDs[0])
     benchTestDF = df[futureMask & ~df['ID'].isin(predictedLineup['ID'])].copy()
 
+    # Same reasoning as the starting-XI filter (computeStartingProbabilities): a blanket
+    # exclusion would also drop a new signing who simply isn't predicted to start (e.g.
+    # a marquee transfer held out of the XI). Coming off the bench is a lower bar than
+    # starting, so the reference population is broader (ANY historical squad
+    # appearance, not just players who've started) and the percentile floor is lower —
+    # more fringe/rotation players get a chance to be sub candidates.
     historicalIDs = set(df[df['Is Future Match'] == False]['ID'])
-    benchTestDF = benchTestDF[benchTestDF['ID'].isin(historicalIDs)].copy()
+    historicalMarketValues = df.loc[df['Is Future Match'] == False, 'Market Value Log']
+    if len(historicalMarketValues) >= 5:
+        valueFloor = historicalMarketValues.quantile(0.10)
+        noHistoryLowValue = (~benchTestDF['ID'].isin(historicalIDs)) & (benchTestDF['Market Value Log'] < valueFloor)
+        excluded = benchTestDF.loc[noHistoryLowValue, 'Player Name'].tolist()
+        if excluded and verbose:
+            print(f'Excluding no-history, below-value-floor sub candidates: {excluded}')
+        benchTestDF = benchTestDF[~noHistoryLowValue].copy()
+    else:
+        benchTestDF = benchTestDF[benchTestDF['ID'].isin(historicalIDs)].copy()
 
     if benchTestDF.empty:
         print('No bench players with historical data found for predicted match.')
         return pd.DataFrame()
 
+    benchTestDF = benchTestDF.reset_index(drop=True)
     rawProbs = finalModel.predict_proba(benchTestDF[featureCols].copy())[:, 1]
-    # Normalize proportionally so probs sum to the historical average subs made per match.
-    # Then scale the whole distribution down if the maximum exceeds 0.90 — even the most
-    # certain sub-in candidate has some chance of not coming on (blowout, extra time, etc.).
+
+    # Replace the raw model output for no-history survivors with a value-percentile
+    # prior (see NO_HISTORY_SUBS_MULTIPLIER comment above computeStartingProbabilities).
+    # Anchored to THIS pool's own median established-candidate score rather than an
+    # absolute probability, since the raw scores here are already compressed by the
+    # shared-budget normalization below relative to a realistic ~7-9 man bench.
+    noHistoryMask = (~benchTestDF['ID'].isin(historicalIDs)).to_numpy()
+    establishedRawProbs = rawProbs[~noHistoryMask]
+    if noHistoryMask.any() and len(establishedRawProbs) > 0:
+        anchor = pd.Series(establishedRawProbs).median()
+        # Weighting toward same-position/same-slot reference players (rather than a
+        # flat whole-squad percentile) — see weightedValuePercentile above
+        # computeStartingProbabilities.
+        historicalReferenceDF = df.loc[df['Is Future Match'] == False, ['Market Value Log', 'Position', 'Detailed Positions']]
+        noHistoryPercentiles = benchTestDF.loc[noHistoryMask].apply(
+            lambda row: weightedValuePercentile(
+                row['Market Value Log'], row['Position'], row['Detailed Positions'], historicalReferenceDF
+            ), axis=1
+        )
+        multipliers = noHistoryPercentiles.apply(lambda p: valuePercentileToPrior(p, NO_HISTORY_SUBS_MULTIPLIER))
+        rawProbs = rawProbs.copy()
+        rawProbs[noHistoryMask] = (anchor * multipliers).clip(0, 1).to_numpy()
+        if verbose:
+            print(f'Using value-percentile prior (not raw model output) for sub-in candidates: '
+                  f'{benchTestDF.loc[noHistoryMask, "Player Name"].tolist()}')
+
+    # Normalize proportionally so probs sum to the historical average subs made per match,
+    # then cap any individual value at 0.90 — even the most certain sub-in candidate has
+    # some chance of not coming on (blowout, extra time, etc.). Capping only the values
+    # that exceed 0.90 (rather than rescaling the whole array down to force the max under
+    # 0.90) keeps one outlier from dragging every other candidate's probability down too.
     avgSubsPerMatch = benchHistoricalDF.groupby('Match ID')['Substituted'].sum().mean()
     expectedSubs = min(avgSubsPerMatch, len(rawProbs))
     total = rawProbs.sum()
     if total > 0:
         scaledProbs = rawProbs / total * expectedSubs
-        maxScaled = scaledProbs.max()
-        if maxScaled > 0.90:
-            scaledProbs = scaledProbs * (0.90 / maxScaled)
         scaledProbs = scaledProbs.clip(0, 0.90)
     else:
         scaledProbs = rawProbs
@@ -1241,22 +1471,52 @@ def predictSubstitutions(subCandidatesDF, team, opposition, home, verbose=True):
 
     return resultDF
 # %%
-def main(leagues=['MLS'], team='Columbus_Crew', date=date.today().strftime('%m-%d-%Y')):
+def main(leagues=['MLS'], team='Columbus_Crew', date=date.today().strftime('%m-%d-%Y'), formationOverride=False):
+    # formationOverride: pass True to be interactively prompted for a formation string
+    # (e.g. '4-2-3-1') to use instead of predictFormation()'s guess for the target
+    # match — useful when SofaScore's historical formation labels are unreliable and
+    # you know the actual shape.
     year = date.split('-')[2]
 
     mainDF, subsDF, predictedMatchIDs, allMissingPlayersDF, predictedMissingPlayers = getData(leagues, team, date)
+
+    if not predictedMatchIDs:
+        print('No target match found — cannot predict a lineup.')
+        return pd.DataFrame(), pd.DataFrame(), {}
 
     mainDF = addPowerRankings(mainDF, year)
 
     mainDF = engineerFeatures(mainDF)
 
     team = mainDF['Team'].iloc[0]
-    home = mainDF['Home'].iloc[0]
-    opposition = mainDF[mainDF['Match ID'] == predictedMatchIDs[0]]['Opposition'].iloc[0]
-    
+    # Read Home/Opposition from the TARGET match's rows — iloc[0] on the full frame
+    # (sorted by player ID) returned an arbitrary match's Home value
+    targetMatchRows = mainDF[mainDF['Match ID'] == predictedMatchIDs[0]]
+    home = bool(targetMatchRows['Home'].iloc[0])
+    opposition = targetMatchRows['Opposition'].iloc[0]
+
+    overridedFormation = None
+    if formationOverride:
+        # Show the actual predicted-match formation, not row 0 of the full frame
+        # (which is sorted by ID/date and would show an arbitrary historical match's
+        # formation instead of this match's).
+        currentGuess = targetMatchRows['Predicted Formation'].iloc[0]
+        invalidEntry = True
+        while invalidEntry:
+            overridedFormation = input(f'This is the sofascore-derived formation: {currentGuess}.\nEnter new formation string (e.g. "4-2-3-1"): ')
+            if overridedFormation in KNOWN_FORMATIONS:
+                invalidEntry = False
+            else:
+                print(f'Unknown formation string. Try again. Known formations: {KNOWN_FORMATIONS}')
+
+        mainDF.loc[mainDF['Match ID'] == predictedMatchIDs[0], 'Predicted Formation'] = overridedFormation
+
     probsDF = computeStartingProbabilities(mainDF.copy(), predictedMatchIDs)
 
-    formation = predictFormation(mainDF).get(predictedMatchIDs[0], '4-3-3')
+    # Use the user's override for the actual slot layout too — previously this always
+    # recomputed predictFormation()'s own guess here, so the override only affected the
+    # classifier's feature and never touched the lineup the ILP actually built.
+    formation = overridedFormation if overridedFormation else predictFormation(mainDF).get(predictedMatchIDs[0], '4-3-3')
 
     predictedLineup = predictLineup(mainDF, probsDF, formation, team, opposition, home)
 

@@ -16,6 +16,7 @@ import urllib.request
 import urllib.parse
 import json
 import io
+import math
 from collections import Counter
 # %%
 def getFiles(currentPath):
@@ -45,21 +46,26 @@ def scrapeURLData(apiURL):
         try:
             response = requests.get(apiURL, headers=headers, impersonate="chrome120", timeout=30)
             break
-        except requests.exceptions.Timeout:
-            print(f"Timeout, retrying... attempt {attempt+1}")
+        except Exception as e:
+            print(f"Request failed ({e}), retrying... attempt {attempt+1}")
             time.sleep(5)
 
     if response is None:
         print(f"Failed to fetch {apiURL} after 3 attempts, skipping.")
         return
 
-    dataJSON = response.json()
+    try:
+        dataJSON = response.json()
+    except Exception as e:
+        print(f"Failed to parse JSON from {apiURL}: {e}")
+        return
     return dataJSON
 #%%
 def loadMatchData(leagues, team, date):
     year = date.split('-')[2]
     matches = {}
 
+    seenMatchIDs = set()
     for league in leagues:
         teamPath = f'/Users/jakeholfinger/Desktop/CC Analyst/Data/SofaScore_Data/{year}_Data/{league.replace(" ", "_")}_Data/{team.replace(" ", "_")}_Data'
         if not os.path.exists(teamPath):
@@ -76,6 +82,16 @@ def loadMatchData(leagues, team, date):
                     scrapedFiles[file] = pd.read_csv(filePath)
                 except Exception:
                     pass
+            # The same match can exist under two folder names (folder dates follow the
+            # machine's timezone at scrape time) — keep only the first copy so form,
+            # formation counts, and rating averages don't double-count it
+            attrs = scrapedFiles.get('Match_Attributes.csv')
+            if attrs is not None and 'id' in attrs.columns:
+                matchID = attrs['id'].iloc[0]
+                if matchID in seenMatchIDs:
+                    print(f'Skipping duplicate match folder {matchFolder} (match ID {matchID})')
+                    continue
+                seenMatchIDs.add(matchID)
             matches[matchFolder] = scrapedFiles
 
     # Folders are named "M-D-YYYY_vs_Opponent" (e.g. "2-21-2026_vs_Portland_Timbers").
@@ -144,12 +160,17 @@ def scrapeTargetMatchData(opposition, date, matches):
                 break
             # API returns {"events": [...], "hasNextPage": bool}
             for match in data.get('events', []):
+                # Match on a +/-1 day window: the user passes the LOCAL calendar date but
+                # kickoff timestamps are UTC, so night games (e.g. >= 8pm ET) land on the
+                # next UTC day and an exact UTC-date comparison misses them. Teams never
+                # play two matches within a day of each other, so the window is unambiguous.
                 matchDate = datetime.fromtimestamp(match.get('startTimestamp', 0), tz=timezone.utc).date()
-                if matchDate == targetDate.date():
+                if abs((matchDate - targetDate.date()).days) <= 1:
                     matchID = match.get('id', None)
                     if matchID:
                         matchAPIURL = f'https://www.sofascore.com/api/v1/event/{matchID}'
-                        matchData = scrapeURLData(matchAPIURL).get('event', {})
+                        eventJSON = scrapeURLData(matchAPIURL)
+                        matchData = eventJSON.get('event', {}) if eventJSON else None
                     foundMatch = True
                     break
             if foundMatch:
@@ -276,10 +297,10 @@ def scrapeWeather(venueLatitude, venueLongitude, startTimestamp):
 
     if startTimestamp > currentTimestamp:
         urlStart = 'https://api.open-meteo.com/v1/forecast'
-        extraParams = '&forecast_days=16'
+        dateParams = f'&forecast_days=16'
     else:
         urlStart = 'https://archive-api.open-meteo.com/v1/archive'
-        extraParams = ''
+        dateParams = f'&start_date={kickoffTime.date()}&end_date={kickoffTime.date()}'
 
     # temperature_unit=fahrenheit and wind_speed_unit=mph give US-friendly values
     url = (
@@ -294,10 +315,8 @@ def scrapeWeather(venueLatitude, venueLongitude, startTimestamp):
         'precipitation_probability'
         f'&temperature_unit=fahrenheit'
         f'&wind_speed_unit=mph'
-        f'&start_date={kickoffTime.date()}'
-        f'&end_date={kickoffTime.date()}'
         f'&timezone=UTC'
-        f'{extraParams}'
+        f'{dateParams}'
     )
 
     try:
@@ -518,7 +537,20 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
         kickoffTime = kickoffDt.strftime('%-m/%-d/%Y @ %-I:%M %p') + f' {tzAbbrev}'
 
     # Team colors live under homeTeam.teamColors / awayTeam.teamColors in the API response
-    isHome = targetMatch.get('homeTeam', {}).get('name') == teamName
+    # Resolve which side the team is on. A one-way name check silently assumed 'away'
+    # whenever the local name didn't exactly match SofaScore's, pulling the wrong team ID
+    # and colors. Check both sides, then fall back to the opposition's side (its name
+    # comes from the same SofaScore data, so if it matches one side the team is the other).
+    homeAPITeamName = targetMatch.get('homeTeam', {}).get('name')
+    awayAPITeamName = targetMatch.get('awayTeam', {}).get('name')
+    if (teamName == homeAPITeamName) or (oppositionName == awayAPITeamName):
+        isHome = True
+    elif (teamName == awayAPITeamName) or (oppositionName == homeAPITeamName):
+        isHome = False
+    else:
+        print(f'Warning: neither "{teamName}" nor "{oppositionName}" matches the API team names '
+              f'("{homeAPITeamName}" vs "{awayAPITeamName}"). Assuming {teamName} is the away team.')
+        isHome = False
     # NOTE: Don't use sofascore's colors as they're 
     #teamKey = 'homeTeam' if isHome else 'awayTeam'
     #primaryColor   = '#' + (targetMatch.get(teamKey, {}).get('teamColors', {}).get('primary', '000000') or '000000').lstrip('#')
@@ -596,14 +628,14 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
 
         #axLeft = page.add_axes([0.07, 0.840, 0.09, 0.13])
         leftTargetX = 0.11
-        leftTargetY = 0.875
+        leftTargetY = 0.9
         axLeft = page.add_axes([(leftTargetX-(logoWidth/2)), (leftTargetY-(logoHeight/2)), logoWidth, logoHeight])
         axLeft.imshow(teamLogo)
         axLeft.axis('off')
 
         #axRight = page.add_axes([0.82, 0.840, 0.09, 0.13])
         rightTargetX = 0.89
-        rightTargetY = 0.875
+        rightTargetY = 0.9
         axRight = page.add_axes([(rightTargetX-(logoWidth/2)), (rightTargetY-(logoHeight/2)), logoWidth, logoHeight])
         axRight.imshow(teamLogo)
         axRight.axis('off')
@@ -641,7 +673,9 @@ def generateMatchInfo(leagues, opposition, date, matches, targetMatch, page, tea
         weatherCondition = str(weatherRow['weather_code'].iloc[0]).upper()
         feelsLike = int(round(weatherRow['apparent_temperature'].iloc[0]))
         rawPrecip = weatherRow['precipitation_probability'].iloc[0]
-        precipStr = f'{int(rawPrecip)}% PRECIP' if rawPrecip is not None else 'PRECIP N/A'
+        # pd.notna also catches NaN — the archive API returns nulls for
+        # precipitation_probability, which pandas can surface as float NaN
+        precipStr = f'{int(rawPrecip)}% PRECIP' if pd.notna(rawPrecip) else 'PRECIP N/A'
         windSpeed = int(round(weatherRow['wind_speed_10m'].iloc[0]))
         windDir = str(weatherRow['wind_direction_10m'].iloc[0])
         weather = f'{weatherCondition}, FEELS LIKE {feelsLike}°F, {precipStr}, {windSpeed} MPH WIND {windDir}'
@@ -651,24 +685,32 @@ def generateMatchInfo(leagues, opposition, date, matches, targetMatch, page, tea
     venueLocationDisplay = venueLocation.upper() if venueLocation.strip(', ') else 'LOCATION TBD'
 
     # Line 1: venue name and playing surface (e.g. "SCOTTS MIRACLE-GRO FIELD - GRASS")
-    page.text(0.5, 0.7925, f'{venueDisplay} - {venueSurface.upper()}', ha='center', fontsize=19)#, fontweight='bold')
+    page.text(0.5, 0.7925, f'{venueDisplay} - {venueSurface.upper()} - {venueLocationDisplay}', ha='center', fontsize=18)#, fontweight='bold')
     # Line 2: city/state and weather summary (e.g. "COLUMBUS, OHIO - SUNNY, FEELS LIKE 78°F, ...")
-    page.text(0.5, 0.760, f'{venueLocationDisplay} - {weather}', ha='center', fontsize=19)#, fontweight='bold')
+    page.text(0.5, 0.760, f'{weather}', ha='center', fontsize=18)#, fontweight='bold')
 
     drawFigureLine(page, teamColors[1], y=0.742)
 
     return page
 #%%
-def getStyleOfPlay():
+def getStyleOfPlay(matches, team, date):
 
-    #TODO: Implement Method
-    
-    return
+    import Indentify_Style_Of_Play
+
+    styleOfPlay = Indentify_Style_Of_Play.main(matches, team=team, date=date)
+
+    print(f'Style of Play: {styleOfPlay}')
+
+    return styleOfPlay
 #%%
 def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
     #TODO: Finish Implementing Method
 
     oppositionName = opposition.replace('_', ' ')
+
+    # Load the opposition's own match history — the passed-in `matches` is the
+    # team's data and would give wrong form/formation results.
+    matches = loadMatchData(leagues, opposition, date)
 
     # Folders are named "M-D-YYYY_vs_Opponent" — sort chronologically by the date prefix
     matches = dict(sorted(matches.items(),
@@ -690,7 +732,7 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
         else:
             form.append('D')
 
-    styleOfPlay = getStyleOfPlay()
+    styleOfPlay = getStyleOfPlay(matches, opposition, date)
 
     # Count which formations the opposition has used; take the top two
     oppositionFormations = []
@@ -701,9 +743,12 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
         # Formations.csv has columns 'Team Name' and 'Formation', one row per team
         rows = formations.loc[formations['Team Name'] == oppositionName, 'Formation']
         if not rows.empty:
-            # Formations are stored as Python list reprs e.g. "['4-2-3-1']" — strip to bare string
-            formStr = str(rows.iloc[0]).strip("[]'\"")
-            oppositionFormations.append(formStr)
+            val = rows.iloc[0]
+            if pd.notna(val):
+                # Formations are stored as Python list reprs e.g. "['4-2-3-1']" — strip to bare string
+                formStr = str(val).strip("[]'\"")
+                if formStr:
+                    oppositionFormations.append(formStr)
 
     counts = Counter(oppositionFormations)
     topFormations = counts.most_common(2)
@@ -735,15 +780,15 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
     page.text(0.5, 0.700, 'TEAM OVERVIEW', ha='center', fontsize=27.5, fontweight='bold')
 
     # Left column (x=0.048): league table, power ranking, form, expected points
-    page.text(0.048, 0.660, f'Table Position: {standing}', fontsize=19)
-    page.text(0.048, 0.620, f'Power Ranking: {powerRanking}', fontsize=19)
-    page.text(0.048, 0.580, f'Form: {" ".join(form)}', fontsize=19)
+    page.text(0.048, 0.660, f'Table Position: {standing}', fontsize=18)
+    page.text(0.048, 0.620, f'Power Ranking: {powerRanking}', fontsize=18)
+    page.text(0.048, 0.580, f'Form: {" ".join(form)}', fontsize=18)
     #page.text(0.048, 0.579, 'Expected Points: N/A', fontsize=22.5)
 
     # Right column (x=0.500): tactical info
-    page.text(0.480, 0.660, f'Primary Formation: {primaryFormation}', fontsize=19)
-    page.text(0.480, 0.620, f'Secondary Formation: {secondaryFormation or "N/A"}', fontsize=19)
-    page.text(0.480, 0.580, f'Style Of Play: {styleOfPlay or "N/A"}', fontsize=19)
+    page.text(0.480, 0.660, f'Primary Formation: {primaryFormation}', fontsize=18)
+    page.text(0.480, 0.620, f'Secondary Formation: {secondaryFormation or "N/A"}', fontsize=18)
+    page.text(0.480, 0.580, f'Style Of Play: {styleOfPlay.get('primary_archetype') or "N/A"}', fontsize=18)
     #page.text(0.500, 0.579, 'Win Probability: N/A', fontsize=22.5)
 
     drawFigureLine(page, teamColors[1], y=0.560)
@@ -754,21 +799,65 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
 #             y = field DEPTH (0=GK goal line, 100=halfway line)
 # This maps directly onto fieldAxis data coordinates: x is horizontal, y is vertical.
 # Right-sided positions (DR, MR, RW) are at high x; left-sided (DL, ML, LW) at low x.
-POSITION_COORDINATES = {
+#
+# The same slot NAME means a different tactical role depending on how many players form
+# the back line, so a single fixed table renders it wrong — e.g. a back-three's DCR/DCL
+# have no fullback outside them and should sit far wider than a back-four's half-space
+# center-backs, and a back-three/five's holding midfield line typically sits a touch
+# deeper (lower y) in front of the extra covering defender. Three tables, chosen by
+# back-line shape, cover this without needing one table per individual formation.
+POSITION_COORDINATES_4BACK = {
     'GK':  (50,  6),
-    'DR':  (88, 32), 'DCR': (67, 23), 'DC':  (50, 23), 'DCL': (33, 23), 'DL':  (12, 32),
-    'DMR': (67, 43), 'DM':  (50, 43), 'DML': (33, 43),
-    'MR':  (88, 55), 'MCR': (67, 55), 'MC':  (50, 55), 'MCL': (33, 55), 'ML':  (12, 55),
-    'RW':  (88, 68), 'AMR': (67, 68), 'AM':  (50, 68), 'AML': (33, 68), 'LW':  (12, 68),
-    'STR': (67, 82), 'ST':  (50, 82), 'STL': (33, 82)
+    'DR':  (88, 30), 'DCR': (63, 30), 'DC':  (50, 30), 'DCL': (37, 30), 'DL':  (12, 30),
+                     'DMR': (63, 43), 'DM':  (50, 43), 'DML': (37, 43),
+    'MR':  (88, 55), 'MCR': (63, 55), 'MC':  (50, 55), 'MCL': (37, 55), 'ML':  (12, 55),
+    'RW':  (88, 68), 'AMR': (63, 68), 'AM':  (50, 68), 'AML': (37, 68), 'LW':  (12, 68),
+                     'STR': (63, 82), 'ST':  (50, 82), 'STL': (37, 82)
 }
+
+POSITION_COORDINATES_3BACK = {
+    'GK':  (50,  6),
+    'DR':  (88, 30), 'DCR': (72, 30), 'DC':  (50, 30), 'DCL': (28, 30), 'DL':  (12, 30),
+                     'DMR': (63, 41), 'DM':  (50, 41), 'DML': (37, 41),
+    'MR':  (88, 52), 'MCR': (63, 52), 'MC':  (50, 52), 'MCL': (37, 52), 'ML':  (12, 52),
+    'RW':  (88, 68), 'AMR': (63, 68), 'AM':  (50, 68), 'AML': (37, 68), 'LW':  (12, 68),
+                     'STR': (63, 82), 'ST':  (50, 82), 'STL': (37, 82)
+}
+
+POSITION_COORDINATES_5BACK = {
+    'GK':  (50,  6),
+    'DR':  (84, 30), 'DCR': (66, 30), 'DC':  (50, 30), 'DCL': (34, 30), 'DL':  (16, 30),
+                     'DMR': (63, 41), 'DM':  (50, 41), 'DML': (37, 41),
+    'MR':  (88, 52), 'MCR': (63, 52), 'MC':  (50, 52), 'MCL': (37, 52), 'ML':  (12, 52),
+    'RW':  (88, 68), 'AMR': (63, 68), 'AM':  (50, 68), 'AML': (37, 68), 'LW':  (12, 68),
+                     'STR': (63, 82), 'ST':  (50, 82), 'STL': (37, 82)
+}
+
+def getShapeCoordinates(slots):
+    '''Choose the back-line-shape coordinate table from a lineup's assigned Formation
+    Slots. DC only appears in back-3/back-5 formations (getFormationSlots); DR/DL only
+    appear in back-4/back-5. Presence of both distinguishes all three shapes without
+    needing the raw formation string.'''
+    defSlots = {s for s in slots if s in ('DR', 'DCR', 'DC', 'DCL', 'DL')}
+    if 'DC' in defSlots and 'DR' in defSlots and 'DL' in defSlots:
+        return POSITION_COORDINATES_5BACK
+    elif 'DC' in defSlots:
+        return POSITION_COORDINATES_3BACK
+    else:
+        return POSITION_COORDINATES_4BACK
 #%%
-def generatePredictedLineup(leagues, opposition, date, matches, page):
+def generatePredictedLineup(leagues, opposition, date, matches, page, formationOverride=False):
 
     import Expected_Lineup_Temp_V2
 
-    with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f):
-            expectedLineup, expectedSubs, missingPlayersDict = Expected_Lineup_Temp_V2.main(leagues, opposition, date)
+    if formationOverride:
+        # formationOverride triggers an input() prompt inside Expected_Lineup_Temp_V2.main
+        # — input()'s prompt text goes to stdout, so it must NOT be suppressed here or
+        # the user would see a blank terminal while the process silently blocks on stdin.
+        expectedLineup, expectedSubs, missingPlayersDict = Expected_Lineup_Temp_V2.main(leagues, opposition, date, formationOverride=formationOverride)
+    else:
+        with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f):
+                expectedLineup, expectedSubs, missingPlayersDict = Expected_Lineup_Temp_V2.main(leagues, opposition, date, formationOverride=formationOverride)
 
     oppositionMatches = loadMatchData(leagues, opposition, date)
     ratingAccum = {}
@@ -847,10 +936,12 @@ def generatePredictedLineup(leagues, opposition, date, matches, page):
         elif rating >= 4.0: return 'orange'
         else: return 'crimson'
 
+    positionCoordinates = getShapeCoordinates(expectedLineup['Slot'].tolist()) if not expectedLineup.empty else POSITION_COORDINATES_4BACK
+
     for _, player in expectedLineup.iterrows():
-        slot = player['Slot'] if player['Slot'] in POSITION_COORDINATES else 'MC'
-        xCoord = POSITION_COORDINATES[slot][0]
-        yCoord = POSITION_COORDINATES[slot][1]
+        slot = player['Slot'] if player['Slot'] in positionCoordinates else 'MC'
+        xCoord = positionCoordinates[slot][0]
+        yCoord = positionCoordinates[slot][1]
         rating = avgPlayerRatings.get(player['Player Name'], 6.0)
         rc = getRatingColor(rating)
         lastName = player['Player Name'].split()[-1]
@@ -858,7 +949,8 @@ def generatePredictedLineup(leagues, opposition, date, matches, page):
         # Number box (top-left)
         fieldAxis.add_patch(Rectangle((xCoord - HW, yCoord), width=NUM_W, height=HH,
                                       linewidth=0.5, edgecolor='dimgray', facecolor='dimgray', zorder=3))
-        fieldAxis.text(xCoord - HW + NUM_W / 2, yCoord + HH / 2, str(int(player['Number'])),
+        playerNumber = '' if (player['Number'] is None or (isinstance(player['Number'], float) and math.isnan(player['Number']))) else str(int(player['Number']))
+        fieldAxis.text(xCoord - HW + NUM_W / 2, yCoord + HH / 2, playerNumber,
                        fontsize=6, color='white', fontweight='bold', ha='center', va='center', zorder=4)
 
         # Rating box (top-centre)
@@ -936,7 +1028,7 @@ def generatePredictedLineup(leagues, opposition, date, matches, page):
 
     return page
 #%%
-def generateFirstPage(leagues, team, opposition, date, matches, targetMatch):
+def generateFirstPage(leagues, team, opposition, date, matches, targetMatch, formationOverride=False):
 
     page, teamColors = generatePageTemplate(team, opposition, targetMatch, frontPage=True)
 
@@ -946,13 +1038,14 @@ def generateFirstPage(leagues, team, opposition, date, matches, targetMatch):
 
     page = generateMatchOverview(leagues, opposition, date, matches, page, teamColors)
 
-    page = generatePredictedLineup(leagues, opposition, date, matches, page)
+    page = generatePredictedLineup(leagues, opposition, date, matches, page, formationOverride=formationOverride)
 
     return page
 
 #%%
-def main(leagues=['MLS'], team='Columbus_Crew', opposition='New_York_City_FC', date='7-22-2026'):
+def main(leagues=['MLS'], team='New_York_City_FC', opposition='Columbus_Crew', date='7-22-2026', formationOverride=True):
     # Note: first value of leagues must be the opposition's primary league
+    # formationOverride: pass a boolean that determines whether the deduced formation should be used or the user should input it
     # Note: date format is 'M-D-YYYY'
 
     matches = loadMatchData(leagues, team, date)
@@ -962,9 +1055,11 @@ def main(leagues=['MLS'], team='Columbus_Crew', opposition='New_York_City_FC', d
         print(f'Could not retrieve match data for {opposition} on {date}. Aborting report.')
         return
 
-    outputPath = f'/Users/jakeholfinger/Desktop/CC Analyst/Prematch Reports/Pre_Match_Report_{opposition}_{date}.pdf'
+    outputDir = '/Users/jakeholfinger/Desktop/CC Analyst/Prematch Reports'
+    os.makedirs(outputDir, exist_ok=True)
+    outputPath = os.path.join(outputDir, f'Pre_Match_Report_{opposition}_{date}.pdf')
     with PdfPages(outputPath) as pdf:
-        pageOne = generateFirstPage(leagues, team, opposition, date, matches, targetMatch)
+        pageOne = generateFirstPage(leagues, team, opposition, date, matches, targetMatch, formationOverride=formationOverride)
         pdf.savefig(pageOne)
         plt.close(pageOne)
 

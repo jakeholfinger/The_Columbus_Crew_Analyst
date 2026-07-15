@@ -10,6 +10,7 @@ import os
 import time
 import random
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import re
@@ -127,30 +128,6 @@ def ScrapePlayerStats(data, playerRows, missingRows, formation):
         for item in data:
             ScrapePlayerStats(item, playerRows, missingRows, formation)
 
-# %%
-def ScrapeShotMap(data, homeDataframe, awayDataframe):
-    if isinstance(data, dict):
-        if 'player' in data.keys() and 'playerCoordinates' in data.keys() and 'shotType' in data.keys():
-            shotData = {'Added Time': data.get('addedTime'),
-                        'Body Part': data.get('bodyPart', ''),
-                        'X Start of Shot': data.get('draw', {}).get('start', {}).get('x'),
-                        'Y Start of Shot': data.get('draw', {}).get('start', {}).get('y'),
-                        'X End of Shot': data.get('draw', {}).get('end', {}).get('x'),
-                        'Y End of Shot': data.get('draw', {}).get('end', {}).get('y'),
-                        'X Goal Shot': data.get('draw', {}).get('goal', {}).get('x'),
-                        'Y Goal Shot': data.get('draw', {}).get('goal', {}).get('y'),
-                        'X Block': data.get('draw', {}).get('block', {}).get('x'),
-                        'Y Block': data.get('draw', {}).get('block', {}).get('y')
-                       }
-            shotData.update(stats)
-        else:
-            #Keep looking through every value
-            for value in data.values():
-                ScrapeShotMap(value, homeDataframe, awayDataframe)
-    elif isinstance(data,list):
-        #Keep looking through every item in the list
-        for item in data:
-            ScrapeShotMap(item, homeDataframe, awayDataframe)
 #%%
 _venue_surface_cache = {}
 
@@ -264,12 +241,17 @@ def ScrapeDataType(homeTeamMatchFolderPath, awayTeamMatchFolderPath, dataType, m
 
     response = safe_request(apiURL, headers)
 
-    #Convert raw data (which is in bytes) into JSON file
-    dataJSON = response.json()
-
-    if dataJSON is None or response.status_code == 404:
+    # safe_request returns None when all retries fail — check BEFORE calling .json()
+    if response is None or response.status_code == 404:
         print(f"Failed to get data from {apiURL}, skipping.")
-        return {}, {}
+        return ({}, {}) if dataType == '/lineups' else None
+
+    #Convert raw data (which is in bytes) into JSON file
+    try:
+        dataJSON = response.json()
+    except Exception as e:
+        print(f"Failed to parse JSON from {apiURL} ({e}), skipping.")
+        return ({}, {}) if dataType == '/lineups' else None
 
     #Declare lists
     homeDataframes = []
@@ -340,16 +322,21 @@ def ScrapeDataType(homeTeamMatchFolderPath, awayTeamMatchFolderPath, dataType, m
         #Filter relevant columns
         dataframe = dataframe.reindex(columns=['id', 'customID', 'attendence', 'hasGlobalHighlights', 'hasXg', 'hasEventPlayerStatistics', 'hasEventPlayerHeatMap', 'crowadsourcingDataDisplayEnabled', 'awayRedCards', 'slug', 'startTimestamp', 'finalResultOnly', 'cupMatchesInRound', 'seasonStatisticsType', 'roundInfo.name', 'roundInfo.round', 'roundInfo.cupRoundType', 'tournament.name', 'tournament.id', 'tournament.slug', 'tournament.category.name', 'tournament.category.id', 'tournament.uniqueTournament.name', 'tournament.uniqueTournament.id', 'tournament.uniqueTournament.primaryColorHex', 'tournament.uniqueTournament.secondaryColorHex', 'tournament.uniqueTournament.hasRounds', 'tournament.uniqueTournament.hasPerformanceGraphFeature', 'tournament.uniqueTournament.hasEventPlayerStatistics', 'tournament.uniqueTournament.displayInverseHomeAwayTeams', 'tournament.competitionType', 'tournament.isGroup', 'season.name', 'season.year', 'season.id', 'status.type', 'venue.venueCoordinates.latitude', 'venue.venueCoordinates.longitude', 'venue.name', 'venue.capacity', 'venue.country.name', 'venue.id', 'venue.city.name', 'referee.name', 'referee.yellowCards', 'referee.redCards', 'referee.yellowRedCards', 'referee.games', 'referee.country.name', 'referee.id', 'homeTeam.name', 'homeTeam.manager.name', 'homeTeam.manager.country.name', 'homeTeam.manager.id', 'homeTeam.national', 'homeTeam.id', 'homeTeam.fullName', 'homeTeam.nameCode', 'homeTeam.teamColors.primary', 'homeTeam.teamColors.secondary', 'homeTeam.teamColors.text','homeTeam.foundationDateTimestamp', 'awayTeam.name', 'awayTeam.manager.name', 'awayTeam.manager.country.slug', 'awayTeam.manager.id', 'awayTeam.venue.venueCoordinates.latitude', 'awayTeam.venueCoordinates.longitude', 'awayTeam.venue.name', 'awayTeam.venue.capacity', 'awayTeam.venue.country.name', 'awayTeam.venue.id', 'awayTeam.venue.city.name', 'awayTeam.nameCode', 'awayTeam.national', 'awayTeam.country.name', 'awayTeam.id', 'awayTeam.fullName', 'awayTeam.teamColors.primary', 'awayTeam.teamColors.secondary', 'awayTeam.teamColors.text', 'awayTeam.foundationDateTimestamp', 'homeScore.display', 'homeScore.period1', 'homeScore.period2', 'homeScore.normalTime', 'homeScore.extra1', 'homeScore.extra2', 'homeScore.overtime', 'homeScore.penalties', 'awayScore.display', 'awayScore.period1', 'awayScore.period2', 'awayScore.normalTime', 'awayScore.extra1', 'awayScore.extra2', 'awayScore.overtime', 'awayScore.penalties', 'aggregatedWinnerCode', 'winnerCode', 'time.injuryTime1', 'time.injuryTime2'])
 
-        if dataframe['venue.name'].iloc[0] is None:
-            venueData = dataJSON.get('homeTeam', {}).get('venue', {})
-            dataframe['venue.name'].iloc[0] = venueData.get('stadium', {}).get('name')
-            dataframe['venue.id'].iloc[0] = venueData.get('id')
-            dataframe['venue.venueCoordinates.latitude'].iloc[0] = venueData.get('venueCoordinates', {}).get('latitude')
-            dataframe['venue.venueCoordinates.longitude'].iloc[0] = venueData.get('venueCoordinates', {}).get('longitude')
-            dataframe['venue.capacity'].iloc[0] = venueData.get('capacity')
-            dataframe['venue.city.name'].iloc[0] = venueData.get('country', {}).get('name')
-            dataframe['venue.country.name'].iloc[0] = venueData.get('city', {}).get('name')
-        dataframe['venue.surface'] = ScrapeVenueSurface(dataframe['venue.name'].iloc[0])
+        # Fall back to the home team's stadium when the event has no venue.
+        # json_normalize yields NaN (not None) for missing values, homeTeam sits under
+        # the 'event' key, city/country were swapped, and chained .iloc assignment
+        # doesn't stick under pandas copy-on-write — all fixed below.
+        if pd.isna(dataframe['venue.name'].iloc[0]):
+            venueData = dataJSON.get('event', {}).get('homeTeam', {}).get('venue', {})
+            dataframe.loc[0, 'venue.name'] = venueData.get('stadium', {}).get('name')
+            dataframe.loc[0, 'venue.id'] = venueData.get('id')
+            dataframe.loc[0, 'venue.venueCoordinates.latitude'] = venueData.get('venueCoordinates', {}).get('latitude')
+            dataframe.loc[0, 'venue.venueCoordinates.longitude'] = venueData.get('venueCoordinates', {}).get('longitude')
+            dataframe.loc[0, 'venue.capacity'] = venueData.get('capacity')
+            dataframe.loc[0, 'venue.city.name'] = venueData.get('city', {}).get('name')
+            dataframe.loc[0, 'venue.country.name'] = venueData.get('country', {}).get('name')
+        venueName = dataframe['venue.name'].iloc[0]
+        dataframe['venue.surface'] = ScrapeVenueSurface(venueName) if pd.notna(venueName) else 'Unknown'
 
         #Add dataframe to list
         homeDataframes.append(dataframe)
@@ -512,14 +499,17 @@ def MatchHasEventData(matchID, headers, homePlayersIDs, awayPlayersIDs):
         for playerID, playerName in zip(playersIDs, playersNames):
             #Construct API URL
             apiURL = f'https://www.sofascore.com/api/v1/event/{matchID}/player/{playerID}/rating-breakdown'
-            #Get data from API request
-            response = requests.get(apiURL, headers=headers, impersonate='chrome120')
-            if response.status_code != 200:
+            #Get data from API request; safe_request retries and returns None on failure
+            #instead of raising and crashing the whole match scrape
+            response = safe_request(apiURL, headers)
+            if response is None or response.status_code != 200:
                 count += 1
                 if count >= 5:
                     return False
             else:
                 return True
+    # Fewer than 5 players and none had event data
+    return False
 
 # %%
 def scrapeOnePlayer(matchID, playerID, playerName, homePlayersIDs, headers, dataTypes, hasEventData):
@@ -599,23 +589,24 @@ def ScrapeEventData(homeRatingBreakdowns, awayRatingBreakdowns, homeHeatmaps, aw
                  '/player/heatmap': ['Player_Heatmaps.csv']
                 }
 
-    checkDataTypes = []
-
     if not overwriteMatchFiles:
-        #Rename the datatype to the list if it should be scraped
-        if '/player/rating-breakdown' in dataTypes:
-            checkDataTypes.append('/player/rating-breakdown')
-        elif '/player/heatmap' in dataTypes:
-            checkDataTypes.append('/player/heatmap')
-        #Loop through all file names for each data type
-        for checkDataType in checkDataTypes:
-            for fileName in fileNames[checkDataType]:
-                homeDataFilePath = os.path.join(homeTeamMatchFolderPath, fileName)
-                awayDataFilePath = os.path.join(awayTeamMatchFolderPath, fileName)
-                #If both data files exist, don't scrape them
-                if os.path.exists(homeDataFilePath) and os.path.exists(awayDataFilePath):
-                    print(f'Skipped Scraping {fileName}')
-                    return
+        #Collect every file this call is expected to produce. Player_Event_Data.csv is
+        #only written when the match has event data, so only require it then.
+        #(Previously an if/elif checked ONLY rating-breakdown and returned as soon as
+        #Player_Event_Data.csv existed, so missing heatmaps were never re-scraped.)
+        requiredFiles = []
+        if hasEventData and '/player/rating-breakdown' in dataTypes:
+            requiredFiles.extend(fileNames['/player/rating-breakdown'])
+        if '/player/heatmap' in dataTypes:
+            requiredFiles.extend(fileNames['/player/heatmap'])
+        #Only skip when EVERY expected file already exists in BOTH match folders
+        if requiredFiles and all(
+            os.path.exists(os.path.join(folderPath, fileName))
+            for fileName in requiredFiles
+            for folderPath in (homeTeamMatchFolderPath, awayTeamMatchFolderPath)
+        ):
+            print(f'Skipped Scraping {", ".join(requiredFiles)}')
+            return
 
     all_players = (
         [(pid, pname) for pname, pid in homePlayersIDs.items()] +
@@ -680,9 +671,14 @@ def GetPlayersIDs(homePlayersIDs, awayPlayersIDs, matchID, headers):
     #Get data from api request
     #response = requests.get(apiURL, headers=headers, impersonate='chrome120')
     response = safe_request(apiURL, headers)
+    if response is None:
+        return
 
     #Convert raw data (which is in bytes) into JSON file
-    data = response.json()
+    try:
+        data = response.json()
+    except Exception:
+        return
 
     #Get player lists
     try:
@@ -730,7 +726,7 @@ def ScrapeMatchData(leagueFolderPath, matchURL, matchID, matchDate, homeTeamName
     print(f'Match Has Event Data: {hasEventData}')
 
     #Declare all potential file names
-    fileNames = ['Player_Spatial_Points.csv', 'Goalkeeper_Spatial_Points.csv', 'Match_Momentum.csv', 'Match_Attributes.csv', 'Player_Statistics.csv', 'Missing_Players.csv', 'Formations.csv', 'Average_Positions.csv', 'Subs.csv', 'Full_Team_Statistics.csv', 'First_Half_Team_Statistics.csv', 'Second_Half_Team_Statistics.csv', 'Player_Event_Data.csv', 'Player_Heatmaps.csv']
+    fileNames = ['Shot_Map.csv', 'Player_Spatial_Points.csv', 'Goalkeeper_Spatial_Points.csv', 'Match_Momentum.csv', 'Match_Attributes.csv', 'Player_Statistics.csv', 'Missing_Players.csv', 'Formations.csv', 'Average_Positions.csv', 'Subs.csv', 'Full_Team_Statistics.csv', 'First_Half_Team_Statistics.csv', 'Second_Half_Team_Statistics.csv', 'Player_Event_Data.csv', 'Player_Heatmaps.csv']
 
     matchFoldersAreIncomplete = False
     #Check if both home and away match folders exist
@@ -867,7 +863,11 @@ def ScrapeSeasonData(leagueName, leagueID, seasonID, yearFolderPath, dataTypes, 
         matchID = match.get('Match ID')
         matchSlug = match.get('Match Slug')
         matchTimestamp = match.get('Match Date')
-        matchDate = datetime.fromtimestamp(matchTimestamp)
+        # Pin folder dates to US Eastern so folder names stay stable regardless of the
+        # machine's timezone. Naive fromtimestamp followed the machine tz — after a tz
+        # change, already-scraped evening matches got re-scraped into +1-day duplicate
+        # folders (e.g. the 5-16/5-17 NYCFC vs NYRB pair).
+        matchDate = datetime.fromtimestamp(matchTimestamp, tz=ZoneInfo('America/New_York'))
         matchDate = matchDate.strftime('%m-%d-%Y').replace('-0', '-').lstrip('0')
 
         #If the match occurred or ended
