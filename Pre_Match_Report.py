@@ -1,5 +1,6 @@
 #%%
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.lines as mlines
@@ -421,6 +422,43 @@ def scrapeVenueSurface(venueName):
         _venue_surface_cache[venueName] = 'Unknown'
         return 'Unknown'
 #%%
+def cropToContent(img, padding=0.04, backgroundTolerance=0.05):
+    '''Crops an RGBA/RGB float image (as returned by mpimg.imread) to the tight bounding
+    box of its non-background content, then re-pads by `padding` (a fraction of the larger
+    cropped dimension) so the content doesn't sit pixel-flush against its box. Falls back
+    to the original image if no content is detected.'''
+    arr = np.asarray(img)
+    if arr.ndim != 3:
+        return img
+
+    height, width = arr.shape[:2]
+
+    if arr.shape[2] == 4:
+        mask = arr[:, :, 3] > backgroundTolerance
+    else:
+        corners = np.concatenate([
+            arr[0, :5, :3].reshape(-1, 3), arr[0, -5:, :3].reshape(-1, 3),
+            arr[-1, :5, :3].reshape(-1, 3), arr[-1, -5:, :3].reshape(-1, 3),
+        ])
+        bgColor = np.median(corners, axis=0)
+        mask = np.abs(arr[:, :, :3] - bgColor).sum(axis=2) > backgroundTolerance
+
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    if rows.size == 0 or cols.size == 0:
+        return img
+
+    top, bottom = rows[0], rows[-1]
+    left, right = cols[0], cols[-1]
+
+    padPx = int(round(padding * max(bottom - top, right - left)))
+    top    = max(0, top - padPx)
+    bottom = min(height - 1, bottom + padPx)
+    left   = max(0, left - padPx)
+    right  = min(width - 1, right + padPx)
+
+    return arr[top:bottom+1, left:right+1]
+#%%
 _team_logo_cache = {}
 #%%
 def scrapeLogo(teamName):
@@ -500,6 +538,7 @@ def scrapeLogo(teamName):
             imageBytes = r.read()
 
         img = mpimg.imread(io.BytesIO(imageBytes), format='png')
+        img = cropToContent(img)
         _team_logo_cache[teamName] = img
         return img
 
@@ -512,6 +551,16 @@ def drawFigureLine(page, color, y, x0=0.018, x1=0.982):
     """Draw a horizontal rule at figure coordinate y, spanning inside the primary border."""
     line = mlines.Line2D([x0, x1], [y, y], transform=page.transFigure, color=color, linewidth=3.0)
     page.add_artist(line)
+#%%
+def fitBoxToAspect(imgShape, maxWidth, maxHeight):
+    '''Returns (width, height) in figure-fraction units that preserve imgShape's aspect
+    ratio while maximizing size within the (maxWidth, maxHeight) ceiling.'''
+    imgHeight, imgWidth = imgShape[:2]
+    imgAspect = imgWidth / imgHeight
+    maxAspect = maxWidth / maxHeight
+    if imgAspect > maxAspect:
+        return maxWidth, maxWidth / imgAspect
+    return maxHeight * imgAspect, maxHeight
 #%%
 def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
 
@@ -623,8 +672,9 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
     # Team logos: placed using add_axes([left, bottom, width, height]) so we can
     # call imshow() on them. axis('off') removes the axes border/ticks.
     if teamLogo is not None:
-        logoWidth = 0.09
-        logoHeight = 0.13
+        maxLogoWidth = 0.13
+        maxLogoHeight = 0.13
+        logoWidth, logoHeight = fitBoxToAspect(teamLogo.shape, maxLogoWidth, maxLogoHeight)
 
         #axLeft = page.add_axes([0.07, 0.840, 0.09, 0.13])
         leftTargetX = 0.11
@@ -786,12 +836,12 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
     #page.text(0.048, 0.579, 'Expected Points: N/A', fontsize=22.5)
 
     # Right column (x=0.500): tactical info
-    page.text(0.480, 0.660, f'Primary Formation: {primaryFormation}', fontsize=18)
-    page.text(0.480, 0.620, f'Secondary Formation: {secondaryFormation or "N/A"}', fontsize=18)
-    page.text(0.480, 0.580, f'Style Of Play: {styleOfPlay.get('primary_archetype') or "N/A"}', fontsize=18)
+    page.text(0.450, 0.660, f'Primary Formation: {primaryFormation}', fontsize=18)
+    page.text(0.450, 0.620, f'Secondary Formation: {secondaryFormation or "N/A"}', fontsize=18)
+    page.text(0.450, 0.580, f'Style Of Play: {styleOfPlay.get('primary_archetype') or "N/A"}', fontsize=18)
     #page.text(0.500, 0.579, 'Win Probability: N/A', fontsize=22.5)
 
-    drawFigureLine(page, teamColors[1], y=0.560)
+    drawFigureLine(page, teamColors[1], y=0.550)
 
     return page
 
@@ -817,7 +867,7 @@ POSITION_COORDINATES_4BACK = {
 
 POSITION_COORDINATES_3BACK = {
     'GK':  (50,  6),
-    'DR':  (88, 30), 'DCR': (72, 30), 'DC':  (50, 30), 'DCL': (28, 30), 'DL':  (12, 30),
+    'DR':  (88, 30), 'DCR': (75, 30), 'DC':  (50, 30), 'DCL': (25, 30), 'DL':  (12, 30),
                      'DMR': (63, 41), 'DM':  (50, 41), 'DML': (37, 41),
     'MR':  (88, 52), 'MCR': (63, 52), 'MC':  (50, 52), 'MCL': (37, 52), 'ML':  (12, 52),
     'RW':  (88, 68), 'AMR': (63, 68), 'AM':  (50, 68), 'AML': (37, 68), 'LW':  (12, 68),
@@ -879,28 +929,28 @@ def generatePredictedLineup(leagues, opposition, date, matches, page, formationO
                           .reset_index()
                           [['index', 'Availibility', 'Slot']]
                           .rename(columns={'index': 'Player', 'Slot': 'Position'}))
-        missingPlayers['Avg Rating'] = missingPlayers['Player'].map(avgPlayerRatings).fillna(6.0)
+        missingPlayers['Avg Rating'] = missingPlayers['Player'].map(avgPlayerRatings).fillna('N/A')
     else:
         missingPlayers = pd.DataFrame()
 
     # --- PERSONNEL SECTION ---
     # Section title — centered, y=0.522 places it just below the Match Overview separator
-    page.text(0.5, 0.522, 'PERSONNEL', ha='center', fontsize=27.5, fontweight='bold')
+    page.text(0.5, 0.505, 'PERSONNEL', ha='center', fontsize=27.5, fontweight='bold')
 
     # Sub-section headers: Expected Lineup (left), Expected Subs (centre-right),
     # Potential Absences (far right). x positions chosen to align with their content areas.
     #page.text(0.09, 0.485, 'Expected Lineup', s='Perfectly Centered', fontsize=22.5, fontweight='bold')
-    page.text(0.26, 0.48, 'Expected Lineup', ha='center', fontsize=22.5, fontweight='bold')
+    page.text(0.26, 0.45, 'Expected Lineup', ha='center', fontsize=22.5, fontweight='bold')
 
 
     # Field axis: left=4.7%, bottom=1%, width=43%, height=46% of the figure.
     # xlim 0-100 = left touchline → right touchline (68 m wide)
     # ylim -5 to 100 = behind goal → halfway line (52.5 m deep); -5 makes room for the goal frame
     #fieldAxis = page.add_axes([0.047, 0.01, 0.43, 0.46])
-    fieldWidth = 0.425
-    fieldHeight = 0.435
+    fieldWidth = 0.4
+    fieldHeight = 0.4
     targetX = 0.26
-    targetY = 0.245
+    targetY = 0.225
     fieldAxis = page.add_axes([(targetX-(fieldWidth/2)), (targetY-(fieldHeight/2)), fieldWidth, fieldHeight])
     fieldAxis.set_xlim(0, 100)
     fieldAxis.set_ylim(-5, 100)
@@ -920,21 +970,31 @@ def generatePredictedLineup(leagues, opposition, date, matches, page, formationO
     #   Top half  [yCoord → yCoord+HH]: [number NUM_W] [rating RAT_W] [position POS_W]
     #   Bot half  [yCoord-HH → yCoord]: black name bar, full width
     # All box widths are fractions of CW so text centers stay correct when CW changes.
-    CW = 18     # card width  — change this to resize all cards uniformly
-    CH = 7.5    # card height
+    CW = 20     # card width  — change this to resize all cards uniformly
+    CH = 8    # card height
     HW = CW / 2
     HH = CH / 2
     NUM_W = 0.30 * CW   # number box  (left 25 %)
     RAT_W = 0.40 * CW   # rating box  (centre 50 %)
     POS_W = 0.30 * CW   # position box (right 25 %)
 
-    def getRatingColor(rating):
-        if rating >= 8.0: return 'royalblue'
-        elif rating >= 7.0: return 'darkgreen'
-        elif rating >= 6.0: return '#4CAF50'
-        elif rating >= 5.0: return 'gold'
-        elif rating >= 4.0: return 'orange'
-        else: return 'crimson'
+    def getRatingColor(rating, sofascore=True):
+        if sofascore:
+            if rating == 'N/A': return 'dimgray'
+            elif rating >= 8.0: return 'royalblue'
+            elif rating >= 7.0: return 'darkgreen'
+            elif rating >= 6.5: return '#4CAF50'
+            elif rating >= 6.0: return 'gold'
+            elif rating >= 5.0: return 'orange'
+            else: return 'crimson'
+        else:
+            if rating == 'N/A': return 'dimgray'
+            elif rating >= 8.0: return 'royalblue'
+            elif rating >= 7.0: return 'darkgreen'
+            elif rating >= 6.0: return '#4CAF50'
+            elif rating >= 5.0: return 'gold'
+            elif rating >= 4.0: return 'orange'
+            else: return 'crimson'
 
     positionCoordinates = getShapeCoordinates(expectedLineup['Slot'].tolist()) if not expectedLineup.empty else POSITION_COORDINATES_4BACK
 
@@ -942,7 +1002,7 @@ def generatePredictedLineup(leagues, opposition, date, matches, page, formationO
         slot = player['Slot'] if player['Slot'] in positionCoordinates else 'MC'
         xCoord = positionCoordinates[slot][0]
         yCoord = positionCoordinates[slot][1]
-        rating = avgPlayerRatings.get(player['Player Name'], 6.0)
+        rating = avgPlayerRatings.get(player['Player Name'], 'N/A')
         rc = getRatingColor(rating)
         lastName = player['Player Name'].split()[-1]
 
@@ -971,18 +1031,18 @@ def generatePredictedLineup(leagues, opposition, date, matches, page, formationO
         fieldAxis.text(xCoord, yCoord - HH / 2, lastName,
                        fontsize=7, color='white', fontweight='bold', ha='center', va='center', zorder=4)
 
-    page.text(0.75,  0.48, 'Expected Subs', ha='center', fontsize=22.5, fontweight='bold')
+    page.text(0.75,  0.45, 'Expected Subs', ha='center', fontsize=22.5, fontweight='bold')
 
     # Subs table: axes occupies the right half of the Personnel section, below the header.
     if expectedSubs is not None and hasattr(expectedSubs, 'values') and len(expectedSubs) > 0:
-        expectedSubs['Avg Match Rating'] = expectedSubs['Player'].map(avgPlayerRatings)#.fillna(6.0)
+        expectedSubs['Avg Match Rating'] = expectedSubs['Player'].map(avgPlayerRatings).fillna('N/A')
         expectedSubs['Sub %'] = expectedSubs['Sub In Probability'].apply(lambda x: f'{x * 100:.1f}')
         reducedExpectedSubs = expectedSubs[['Player', 'Slot', 'Sub %', 'Avg Match Rating']].rename(columns={'Slot': 'Position', 'Avg Match Rating': 'Avg Rating'})
         #subsAx = page.add_axes([0.55, 0.14, 0.40, 0.45])
-        tableWidth = 0.40
-        tableHeight = 0.45
+        tableWidth = 0.425
+        tableHeight = 0.4
         targetX = 0.725
-        targetY = 0.37
+        targetY = 0.335
         subsAx = page.add_axes([(targetX-(tableWidth/2)), (targetY-(tableHeight/2)), tableWidth, tableHeight])
 
         subsAx.axis('off')
@@ -1000,13 +1060,13 @@ def generatePredictedLineup(leagues, opposition, date, matches, page, formationO
             cell.set_linewidth(0)        
             cell.set_edgecolor('none')
 
-    page.text(0.75,  0.22, 'Potential Absences', ha='center', fontsize=22.5, fontweight='bold')
+    page.text(0.75,  0.20, 'Potential Absences', ha='center', fontsize=22.5, fontweight='bold')
 
     # Absences table: narrow axes in the bottom-right of the Personnel section.
     if isinstance(missingPlayers, pd.DataFrame) and not missingPlayers.empty:
         #absAx = page.add_axes([0.50, -0.05, 0.45, 0.35])
         tableWidth = 0.40
-        tableHeight = 0.35
+        tableHeight = 0.325
         targetX = 0.74
         targetY = 0.12
         absAx = page.add_axes([(targetX-(tableWidth/2)), (targetY-(tableHeight/2)), tableWidth, tableHeight])
