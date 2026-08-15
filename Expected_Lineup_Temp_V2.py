@@ -8,6 +8,7 @@ from scipy.stats import linregress
 from xgboost import XGBClassifier, XGBRegressor
 from sklearn.metrics import log_loss
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.isotonic import IsotonicRegression
 from pulp import LpProblem, LpMaximize, LpVariable, LpBinary, lpSum, PULP_CBC_CMD, value
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
@@ -117,6 +118,7 @@ def scrapeNextMatches(teamID, targetDateTimestamp):
         for player in teamData.get('missingPlayers', []):
             missingPlayersDict[player['player']['name']] = {
                 'ID': player['player']['id'],
+                'Position': player['player'].get('position', ''),
                 'Availibility': player.get('type', ''),
                 'Expected End Date': player.get('expectedEndDate', '').split('T')[0]
             }
@@ -134,7 +136,8 @@ def scrapeNextMatches(teamID, targetDateTimestamp):
             'ID': player.get('id'),
             'Position': player.get('position', ''),
             'Detailed Positions': player.get('positionsDetailed', []),
-            'Sofascore Market Value': player.get('proposedMarketValue')
+            'Sofascore Market Value': player.get('proposedMarketValue'),
+            'Birth Time': player.get('dateOfBirthTimestamp')
         }
 
     # Build futureDF: one row per available player per match
@@ -149,6 +152,7 @@ def scrapeNextMatches(teamID, targetDateTimestamp):
                 'Position': playerInfo['Position'],
                 'Detailed Positions': playerInfo['Detailed Positions'],
                 'Sofascore Market Value': playerInfo['Sofascore Market Value'],
+                'Birth Time': playerInfo['Birth Time'],
                 'Match ID': matchRow['matchID'],
                 'Start Timestamp': matchRow['matchTime'],
                 'Team': matchRow['team'],
@@ -222,6 +226,8 @@ def getFormationSlots(formation):
         return ['GK', 'DR', 'DCR', 'DCL', 'DL', 'MR', 'MCR', 'MCL', 'ML', 'STR', 'STL']
     elif formation == '4-2-3-1':
         return ['GK', 'DR', 'DCR', 'DCL', 'DL', 'DMR', 'DML', 'MR', 'AM', 'ML', 'ST']
+    elif formation == '4-2-2-2':
+        return ['GK', 'DR', 'DCR', 'DCL', 'DL', 'DMR', 'DML', 'AMR', 'AML', 'STR', 'STL']
     elif formation == '4-1-3-2':
         return ['GK', 'DR', 'DCR', 'DCL', 'DL', 'DM', 'MR', 'AM', 'ML', 'STR', 'STL']
     elif formation == '4-4-1-1':
@@ -233,9 +239,9 @@ def getFormationSlots(formation):
     elif formation == '3-4-2-1' or formation == '3-4-3':
         return ['GK', 'DCR', 'DC', 'DCL', 'MR', 'MCR', 'MCL', 'ML', 'AMR', 'ST', 'AML']
     elif formation == '3-4-1-2':
-        return ['GK', 'DCR', 'DC', 'DCL', 'MR', 'MCR', 'MCL', 'MR', 'AM', 'STR', 'STL']
+        return ['GK', 'DCR', 'DC', 'DCL', 'MR', 'MCR', 'MCL', 'ML', 'AM', 'STR', 'STL']
     elif formation == '3-5-2':
-        return ['GK', 'DCR', 'DC', 'DCL', 'MR', 'MCR', 'MC', 'MCL', 'MR', 'STR', 'STL']
+        return ['GK', 'DCR', 'DC', 'DCL', 'MR', 'MCR', 'MC', 'MCL', 'ML', 'STR', 'STL']
     elif formation == '5-3-2':
         return ['GK', 'DR', 'DCR', 'DC', 'DCL', 'DL', 'MCR', 'MC', 'MCL', 'STR', 'STL']
     elif formation == '5-4-1':
@@ -407,6 +413,11 @@ def getData(leagues, team, date):
     mainDF.sort_values(by='Start Timestamp', inplace=True)
     mainDF['Days Since Season Start'] = ((mainDF['Start Timestamp'] - mainDF['Start Timestamp'].iloc[0]) / 86400).round(0)
 
+    # Player's age at the time of each match (fractional years). Computed here while
+    # 'Start Timestamp' is still available; NaN where 'Birth Time' wasn't scraped
+    # (handled downstream in engineerFeatures, not treated as an error here).
+    mainDF['Age'] = (mainDF['Start Timestamp'] - mainDF['Birth Time']) / (365.25 * 86400)
+
     mainDF['Availability'] = mainDF['Availability'].fillna('Available')
     mainDF['Home'] = mainDF['Home'].astype(float)
 
@@ -418,7 +429,7 @@ def getData(leagues, team, date):
     mainDF = mainDF.merge(uniqueOpps[['Opposition ID', 'Opposition Primary Competition', 'Opposition Primary Competition ID']], how='left', on='Opposition ID')
     
     # Select only relevant columns
-    mainDF = mainDF[['Player Name', 'ID', 'Number', 'Position', 'Detailed Positions', 'Formation Slot', 'Captain', 'Sofascore Market Value', 'Started', 'Substituted', 'Minutes Played', 'Rating', 'Availability', 'Match ID', 'Is Future Match', 'Days Since Season Start', 'Competition', 'Home', 'Team', 'Team ID', 'Formation', 'Opposition', 'Opposition ID', 'Opposition Formation', 'Opposition Primary Competition', 'Opposition Primary Competition ID']]
+    mainDF = mainDF[['Player Name', 'ID', 'Number', 'Position', 'Detailed Positions', 'Formation Slot', 'Captain', 'Sofascore Market Value', 'Age', 'Started', 'Substituted', 'Minutes Played', 'Rating', 'Availability', 'Match ID', 'Is Future Match', 'Days Since Season Start', 'Competition', 'Home', 'Team', 'Team ID', 'Formation', 'Opposition', 'Opposition ID', 'Opposition Formation', 'Opposition Primary Competition', 'Opposition Primary Competition ID']]
 
     subsDF = pd.concat(subsList, ignore_index=True) if subsList else pd.DataFrame(columns=['playerOut.id', 'playerIn.id', 'Match ID', 'time'])
     allMissingPlayersDF = pd.concat(missingPlayersList, ignore_index=True) if missingPlayersList else pd.DataFrame(columns=['ID', 'Availability', 'Match ID'])
@@ -546,6 +557,26 @@ def engineerFeatures(df):
     df['Sofascore Market Value'] = df['Sofascore Market Value'].fillna(df['Sofascore Market Value'].min())
     df['Market Value Log'] = np.log(df['Sofascore Market Value']+1)
 
+    # Transfer valuations price in resale value and remaining contract length, not
+    # just current ability, so they systematically undervalue older players relative
+    # to their actual start-likelihood. Fit the age -> log(market value) curve
+    # empirically across this team's own player pool (one point per player, not per
+    # match row, so a player with more appearances doesn't dominate the fit) and
+    # overwrite each player's value with their deviation from that curve, re-centered
+    # on the pool's mean so the column stays on a similar scale. Same
+    # fit-against-the-pool philosophy as the league-relative scaling fix in
+    # Indentify_Style_Of_Play, just scoped to the team pool this function already
+    # works with. Every downstream use of 'Market Value Log' (classifier feature,
+    # cold-start value floors) picks this up automatically — nothing else to change.
+    onePerPlayer = df.dropna(subset=['Age', 'Market Value Log']).sort_values('Days Since Season Start').drop_duplicates('ID', keep='last')
+    if len(onePerPlayer) >= 5:
+        ageCurve = np.polyfit(onePerPlayer['Age'], onePerPlayer['Market Value Log'], deg=2)
+        expectedValueGivenAge = np.polyval(ageCurve, df['Age'])
+        adjustedValue = df['Market Value Log'] - expectedValueGivenAge + onePerPlayer['Market Value Log'].mean()
+        df['Market Value Log'] = adjustedValue.fillna(df['Market Value Log'])
+    # else: not enough players with known ages in this team's pool to fit a stable
+    # curve — leave the raw (unadjusted) log value in place.
+
     # Player Ratings and Usage
     df = df.sort_values(['ID', 'Days Since Season Start']).copy()
     historicalMask = ~df['Is Future Match']
@@ -587,7 +618,16 @@ def engineerFeatures(df):
 
     # Player Availability
     df = df.sort_values(['ID', 'Days Since Season Start'])
-    df['Matches Since Last Played'] = df.groupby('ID')['Played'].transform(lambda x: (~x.astype(bool)).groupby(x.cumsum()).cumcount())
+    # shift(1) first so this reflects matches missed BEFORE the current row, not
+    # including it — without the shift, a row's own 'Played' leaks into predicting
+    # that same row's 'Started' (a historical row where the player didn't feature
+    # already shows >=1 on itself, and every future/target row's 'Played' is forced
+    # to 0 by construction since the outcome isn't known yet, so ALL future
+    # candidates would land on >=1 regardless of their real recent form).
+    def matchesSinceLastPlayed(playedSeries):
+        shiftedPlayed = playedSeries.shift(1).fillna(0)
+        return (~shiftedPlayed.astype(bool)).groupby(shiftedPlayed.cumsum()).cumcount()
+    df['Matches Since Last Played'] = df.groupby('ID')['Played'].transform(matchesSinceLastPlayed)
     matchDF = df[['Match ID', 'Days Since Season Start']].drop_duplicates().sort_values('Days Since Season Start').reset_index(drop=True)
     matchDF['Global Match Number'] = range(len(matchDF))
     df = df.merge(matchDF[['Match ID', 'Global Match Number']], on='Match ID', how='left')
@@ -872,6 +912,20 @@ def computeStartingProbabilities(df, predictedMatchIDs, verbose=True):
         featureImportance = pd.DataFrame({'Feature': xTrainingTest.columns, 'Importance': valModel.feature_importances_}).sort_values('Importance', ascending=False)
         print(featureImportance.to_string())
 
+    # Calibrate the raw model output against real observed outcomes on the held-out
+    # validation split. Without this, an established player's raw predict_proba and a
+    # no-history player's NO_HISTORY_STARTS_PRIOR value (itself fit from real debut
+    # frequencies) aren't guaranteed to be on the same scale — nothing stops a
+    # well-formed player with modest raw-model output from losing a slot to a
+    # brand-new signing's flat prior even when the established player's own recent
+    # form clearly outperforms it. Guard on sample size/class variance the same way
+    # other empirical fits in this file do (e.g. the >= 5 checks below); fall back to
+    # the uncalibrated raw probabilities rather than skip the prediction.
+    calibrator = None
+    if len(yValidation) >= 20 and yValidation.nunique() > 1:
+        calibrator = IsotonicRegression(out_of_bounds='clip')
+        calibrator.fit(validationProbabilities, yValidation)
+
     # Train Final model
     finalModel = XGBClassifier(
         n_estimators = 300,
@@ -889,6 +943,8 @@ def computeStartingProbabilities(df, predictedMatchIDs, verbose=True):
     finalModel.fit(xTrain, yTrain)
 
     starterProbabilities = finalModel.predict_proba(xTest)[:, 1]
+    if calibrator is not None:
+        starterProbabilities = calibrator.predict(starterProbabilities)
 
     testPlayers['Starter Probability'] = starterProbabilities
 
@@ -921,18 +977,92 @@ SIMILAR_SLOTS = {'DL': ['DR', 'ML'], 'DR': ['DL', 'MR'],
                     'DML': ['MCL', 'MC', 'MCR'], 'DM': ['MCL', 'MC', 'MCR'], 'DMR': ['MCL', 'MC', 'MCR'],
                     'MCL': ['DML', 'DM', 'DMR', 'AML', 'AM', 'AMR'], 'MC': ['DML', 'DM', 'DMR', 'AML', 'AM', 'AMR'], 'MCR': ['DML', 'DM', 'DMR', 'AML', 'AM', 'AMR'],
                     'ML': ['DL', 'MR', 'LW'], 'MR': ['DR', 'ML', 'RW'], 'AML': ['MCL', 'MC', 'MCR'], 'AM': ['MCL', 'MC', 'MCR'], 'AMR': ['MCL', 'MC', 'MCR'], 'RW': ['LW', 'MR'], 'LW': ['RW', 'ML']}
+
+# Some slot codes mean a structurally different role depending on the rest of the
+# formation's shape — same string, different job. Each entry below is (slot set,
+# function mapping a formation string to its "flavor" for that slot set); a
+# historical appearance in one of these slots only counts as an exact match for the
+# CURRENT formation if the two formations share the same flavor (see
+# getEligibleSlots). Slots not covered by any entry are never shape-filtered.
+
+def cbShapeGroup(formation):
+    '''DC only appears in back-3/back-5 formations, where the center-back trio
+    (DCR/DC/DCL) is a genuinely different shape than back-4's flat pair (DCR/DCL, no
+    DC). Back-3 and back-5 share the 'trio' grouping (both field a spare central CB);
+    back-4 is 'pair' (only ever two). Mirrors the back-count distinction
+    Pre_Match_Report's getShapeCoordinates already makes for display. Returns None
+    for an unparseable formation string.'''
+    try:
+        backCount = int(str(formation).split('-')[0])
+    except (ValueError, IndexError):
+        return None
+    return 'pair' if backCount == 4 else 'trio'
+
+def wideMidShapeGroup(formation):
+    '''ML/MR mean a different job depending on whether the formation also fields
+    DL/DR. When it does (most back-4s, and 5-4-1), ML/MR are advanced wide
+    midfielders with a fullback/wingback behind them. When it doesn't — every back-3
+    formation here, which never fields DL/DR — ML/MR are lone wing-backs covering
+    the whole flank alone, a much more defensively demanding role than the same
+    slot code implies in a back-4.'''
+    return 'supported' if 'DL' in getFormationSlots(formation) else 'wingback'
+
+def centralMidShapeGroup(formation):
+    '''MC only appears in formations with a genuine central-midfield trio
+    (MCR/MC/MCL, e.g. 4-3-3, 5-3-2); other formations pair MCR/MCL alone (e.g.
+    4-4-2, 4-4-1-1), with a separate wide-midfield band providing width instead.
+    Same slot codes, different job — checked directly off 'MC' presence rather than
+    inferred from ML/MR, since the two aren't perfectly inverse (3-5-2 fields both a
+    central trio and wing-backs).'''
+    return 'trio' if 'MC' in getFormationSlots(formation) else 'pair'
+
+SHAPE_AWARE_SLOT_FAMILIES = [
+    ({'DC', 'DCR', 'DCL'}, cbShapeGroup),
+    ({'ML', 'MR'}, wideMidShapeGroup),
+    ({'MC', 'MCR', 'MCL'}, centralMidShapeGroup),
+]
+
+def slotShapeMatches(slot, historicalFormation, currentFormation):
+    '''True unless `slot` belongs to a shape-aware family (above) whose flavor
+    differs between the historical and current formation.'''
+    for slotFamily, shapeGroupFn in SHAPE_AWARE_SLOT_FAMILIES:
+        if slot in slotFamily:
+            return shapeGroupFn(historicalFormation) == shapeGroupFn(currentFormation)
+    return True
+
+# Half-life (in games) for recency-weighting a player's slot history — same value
+# and decay shape as Indentify_Style_Of_Play.classify_team_style's half_life=5, so
+# a role from 5 games ago counts half as much as last match.
+SLOT_RECENCY_HALF_LIFE = 5
 #%%
-def getEligibleSlots(row, allPlayersPlayedSlots, formationSlots):
+def getEligibleSlots(row, allPlayersPlayedSlots, formationSlots, formation):
     import ast
     formationSlotsSet = set(formationSlots)
     primarySlots   = set()
     secondarySlots = set()
     tertiarySlots  = set()
 
-    # Get played slots: primary is the most played slot, secondary is all other played slots
-    playedSlots = allPlayersPlayedSlots['Formation Slot'].dropna()
+    # Get played slots: primary is the most-played slot, weighted so recent matches
+    # count more than older ones (games-ago half-life decay, same convention as
+    # Indentify_Style_Of_Play.classify_team_style) — a player's settled role can
+    # change over a season, so a stale primary shouldn't outweigh a recent one.
+    # A historical appearance in a shape-aware slot (CB or wide-mid families, see
+    # SHAPE_AWARE_SLOT_FAMILIES above) only counts toward PRIMARY if it came from a
+    # formation with the same flavor as the current one. A shape-mismatched
+    # appearance still counts toward secondary below, so that history isn't lost,
+    # just demoted a tier rather than treated as an exact positional match.
+    playedRows = allPlayersPlayedSlots.dropna(subset=['Formation Slot']).sort_values('Days Since Season Start')
+    playedSlots = playedRows['Formation Slot']
     if not playedSlots.empty:
-        primarySlots   = {playedSlots.value_counts().index[0]}     # most-played slot as a set
+        gamesAgo = np.arange(len(playedRows))[::-1]
+        weighted = pd.DataFrame({
+            'slot': playedRows['Formation Slot'],
+            'weight': 0.5 ** (gamesAgo / SLOT_RECENCY_HALF_LIFE),
+            'shapeMatched': playedRows.apply(lambda r: slotShapeMatches(r['Formation Slot'], r['Formation'], formation), axis=1)
+        }, index=playedRows.index)
+        shapeMatched = weighted[weighted['shapeMatched']]
+        if not shapeMatched.empty:
+            primarySlots = {shapeMatched.groupby('slot')['weight'].sum().idxmax()}  # most-played (recency-weighted) shape-compatible slot
         secondarySlots = set(playedSlots.unique()) - primarySlots  # all other played slots
 
         # Add comparable slots of all played slots to secondary
@@ -1003,14 +1133,14 @@ def predictLineup(mainDF, probsDF, formation, team, opposition, home, verbose=Tr
     probsDF = probsDF.reset_index(drop=True)
     players = probsDF.index.tolist()
 
-    allPlayersPlayedSlots = mainDF[['Player Name', 'Formation', 'Formation Slot']]
+    allPlayersPlayedSlots = mainDF[['Player Name', 'Formation', 'Formation Slot', 'Days Since Season Start']]
 
     primaryEligibility = {}
     secondaryEligibility = {}
     tertiaryEligibility = {}
     for p in players:
         playerName = probsDF.loc[p, 'Player Name']
-        primary, secondary, tertiary = getEligibleSlots(probsDF.loc[p], allPlayersPlayedSlots[allPlayersPlayedSlots['Player Name'] == playerName], formationSlots)
+        primary, secondary, tertiary = getEligibleSlots(probsDF.loc[p], allPlayersPlayedSlots[allPlayersPlayedSlots['Player Name'] == playerName], formationSlots, formation)
         primaryEligibility[p] = primary
         secondaryEligibility[p] = secondary
         tertiaryEligibility[p] = tertiary
@@ -1029,7 +1159,7 @@ def predictLineup(mainDF, probsDF, formation, team, opposition, home, verbose=Tr
 
     # Objective: maximize starter probability weighted by position tier.
     # Weights are small enough to only break ties, not override probability differences.
-    TIER_WEIGHTS = {'primary': 1.0, 'secondary': 0.80, 'tertiary': 0.50}
+    TIER_WEIGHTS = {'primary': 1.0, 'secondary': 0.80, 'tertiary': 0.33}
     prob += (
         lpSum(TIER_WEIGHTS['primary']   * probsDF.loc[p, 'Starter Probability'] * assign[p, s] for p in players for s in primaryEligibility[p]   if (p, s) in assign) +
         lpSum(TIER_WEIGHTS['secondary'] * probsDF.loc[p, 'Starter Probability'] * assign[p, s] for p in players for s in secondaryEligibility[p] if (p, s) in assign) +
@@ -1541,7 +1671,13 @@ def main(leagues=['MLS'], team='Columbus_Crew', date=date.today().strftime('%m-%
             .to_dict()
         )
         for name, info in predictedMissingPlayers.items():
-            info['Slot'] = mostLikelySlot.get(name) or mostLikelyPosition.get(name) or ''
+            # Prefer the team's own historical labels (most specific to least), but
+            # fall back to the position SofaScore itself lists for the player
+            # (captured in scrapeNextMatches, always available even when the local
+            # {year}_Data folder has no matches for them yet — e.g. a player who
+            # hasn't featured at all so far this season has no historical rows to
+            # look up a slot/position from, but SofaScore's own listing still has one).
+            info['Slot'] = mostLikelySlot.get(name) or mostLikelyPosition.get(name) or info.get('Position') or ''
 
     return predictedLineup, predictedSubstitutions, predictedMissingPlayers
 

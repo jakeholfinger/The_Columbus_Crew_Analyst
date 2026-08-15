@@ -112,29 +112,49 @@ def loadMatchData(leagues, team, date):
 
     return filteredMatches
 #%%
-def scrapeTargetMatchData(opposition, date, matches):
+def findOppositionTeamID(leagueFolders, opposition, year):
+    '''Scans each given league's locally saved data for `opposition`'s own team folder
+    and returns their SofaScore team ID from any match inside it (a team's ID doesn't
+    change match-to-match, so the first one found is enough). Returns None if not found
+    in any of the given leagues.'''
+    oppositionName = opposition.replace('_', ' ')
+    for league in leagueFolders:
+        leaguePath = f'/Users/jakeholfinger/Desktop/CC Analyst/Data/SofaScore_Data/{year}_Data/{league.replace(" ", "_")}_Data'
+        if not os.path.exists(leaguePath):
+            continue
+        for teamFolder in getFiles(leaguePath):
+            if teamFolder.removesuffix('_Data') != opposition:
+                continue
+            teamPath = os.path.join(leaguePath, teamFolder)
+            if not os.path.isdir(teamPath):
+                continue
+            for matchFolder in getFiles(teamPath):
+                attrsPath = os.path.join(teamPath, matchFolder, 'Match_Attributes.csv')
+                if not os.path.exists(attrsPath):
+                    continue
+                matchAttributes = pd.read_csv(attrsPath)
+                homeTeamName = matchAttributes['homeTeam.name'].iloc[0]
+                awayTeamName = matchAttributes['awayTeam.name'].iloc[0]
+                if homeTeamName == oppositionName:
+                    return int(matchAttributes['homeTeam.id'].iloc[0])
+                elif awayTeamName == oppositionName:
+                    return int(matchAttributes['awayTeam.id'].iloc[0])
+            break  # found the opposition's folder for this league; no need to keep scanning
+    return None
+#%%
+def scrapeTargetMatchData(leagues, opposition, date):
     # Added `date` parameter — was previously read from outer scope (a scoping bug)
     oppositionName = opposition.replace('_', ' ')
 
-    # Search historical match data to find the opposition's SofaScore team ID.
-    # We loop through all loaded matches because the first match may not involve
-    # the opposition.
-    oppositionID = None
-    for matchFolder, matchFiles in matches.items():
-        matchAttributes = matchFiles.get('Match_Attributes.csv')
-        if matchAttributes is None:
-            continue
-        homeTeamName = matchAttributes['homeTeam.name'].iloc[0]
-        awayTeamName = matchAttributes['awayTeam.name'].iloc[0]
-        if homeTeamName == oppositionName:
-            oppositionID = int(matchAttributes['homeTeam.id'].iloc[0])
-            break
-        elif awayTeamName == oppositionName:
-            oppositionID = int(matchAttributes['awayTeam.id'].iloc[0])
-            break
+    # Find the opposition's SofaScore team ID by locating their own folder
+    # somewhere in the league's locally saved data (not the focus team's match
+    # history) — the focus team may not have played the opposition yet this
+    # season, but the opposition's own matches are typically scraped independently.
+    year = date.split('-')[2]
+    oppositionID = findOppositionTeamID(leagues, opposition, year)
 
     if oppositionID is None:
-        print(f'Could not find team ID for {oppositionName} in loaded match data.')
+        print(f'Could not find team ID for {oppositionName} in local league data.')
         return None
 
     # Build target date as a UTC datetime and compare to now to decide which
@@ -466,81 +486,91 @@ def scrapeLogo(teamName):
     if teamName in _team_logo_cache:
         return _team_logo_cache[teamName]
 
+    wikiHeaders = {'User-Agent': 'CCAnalystBot/1.0 (thecolumbuscrewanalyst@gmail.com) Python-urllib/3'}
+
+    # Appending a club-type suffix disambiguates a bare club name from other Wikipedia
+    # articles that happen to share it (players, other sports) — "soccer club" works for
+    # MLS teams, whose own Wikipedia coverage uses American phrasing. But for clubs whose
+    # coverage uses international phrasing instead, "soccer club" can rank a lower-
+    # relevance page above the club itself: confirmed live, "Pumas UNAM soccer club"
+    # surfaces a player's bio ahead of the "Pumas UNAM" club page, so no infobox logo was
+    # ever found and scrapeLogo silently returned None. Try each suffix in turn, only
+    # falling through to the next if the current one doesn't resolve to an actual logo.
+    querySuffixes = [' soccer club', ' football club', '']
+
     try:
-        wikiHeaders = {'User-Agent': 'CCAnalystBot/1.0 (thecolumbuscrewanalyst@gmail.com) Python-urllib/3'}
+        for suffix in querySuffixes:
+            searchParams = {
+                'action': 'query',
+                'list': 'search',
+                'srsearch': teamName + suffix,
+                'srnamespace': '0',
+                'srlimit': '1',
+                'format': 'json'
+            }
+            searchURL = 'https://en.wikipedia.org/w/api.php?' + urllib.parse.urlencode(searchParams)
+            with urllib.request.urlopen(urllib.request.Request(searchURL, headers=wikiHeaders)) as r:
+                results = json.loads(r.read()).get('query', {}).get('search', [])
+            if not results:
+                continue
 
-        searchParams = {
-            'action': 'query',
-            'list': 'search',
-            'srsearch': teamName + ' soccer club',
-            'srnamespace': '0',
-            'srlimit': '1',
-            'format': 'json'
-        }
-        searchURL = 'https://en.wikipedia.org/w/api.php?' + urllib.parse.urlencode(searchParams)
-        with urllib.request.urlopen(urllib.request.Request(searchURL, headers=wikiHeaders)) as r:
-            results = json.loads(r.read()).get('query', {}).get('search', [])
-        if not results:
-            _team_logo_cache[teamName] = None
-            return None
+            pageTitle = results[0]['title']
 
-        pageTitle = results[0]['title']
+            parseParams = {
+                'action': 'parse',
+                'page': pageTitle,
+                'prop': 'wikitext',
+                'format': 'json'
+            }
+            parseURL = 'https://en.wikipedia.org/w/api.php?' + urllib.parse.urlencode(parseParams)
+            with urllib.request.urlopen(urllib.request.Request(parseURL, headers=wikiHeaders)) as r:
+                wikitext = json.loads(r.read()).get('parse', {}).get('wikitext', {}).get('*', '')
 
-        parseParams = {
-            'action': 'parse',
-            'page': pageTitle,
-            'prop': 'wikitext',
-            'format': 'json'
-        }
-        parseURL = 'https://en.wikipedia.org/w/api.php?' + urllib.parse.urlencode(parseParams)
-        with urllib.request.urlopen(urllib.request.Request(parseURL, headers=wikiHeaders)) as r:
-            wikitext = json.loads(r.read()).get('parse', {}).get('wikitext', {}).get('*', '')
+            imageMatch = re.search(
+                r'\|\s*(?:image|logo|logo_file|image_file)\s*=\s*([^\n{}]+)',
+                wikitext, re.IGNORECASE
+            )
+            if not imageMatch:
+                continue
 
-        imageMatch = re.search(
-            r'\|\s*(?:image|logo|logo_file|image_file)\s*=\s*([^\n{}]+)',
-            wikitext, re.IGNORECASE
-        )
-        if not imageMatch:
-            _team_logo_cache[teamName] = None
-            return None
+            rawField = imageMatch.group(1).strip()
+            fileMatch = re.search(r'(?:File:|Image:)?([^\[\]|]+\.(?:svg|png|jpg|jpeg))', rawField, re.IGNORECASE)
+            if not fileMatch:
+                continue
+            fileName = fileMatch.group(1).strip()
 
-        rawField = imageMatch.group(1).strip()
-        fileMatch = re.search(r'(?:File:|Image:)?([^\[\]|]+\.(?:svg|png|jpg|jpeg))', rawField, re.IGNORECASE)
-        if not fileMatch:
-            _team_logo_cache[teamName] = None
-            return None
-        fileName = fileMatch.group(1).strip()
+            infoParams = {
+                'action': 'query',
+                'titles': f'File:{fileName}',
+                'prop': 'imageinfo',
+                'iiprop': 'url',
+                'iiurlwidth': '200',
+                'format': 'json'
+            }
+            infoURL = 'https://en.wikipedia.org/w/api.php?' + urllib.parse.urlencode(infoParams)
+            with urllib.request.urlopen(urllib.request.Request(infoURL, headers=wikiHeaders)) as r:
+                pages = json.loads(r.read()).get('query', {}).get('pages', {})
 
-        infoParams = {
-            'action': 'query',
-            'titles': f'File:{fileName}',
-            'prop': 'imageinfo',
-            'iiprop': 'url',
-            'iiurlwidth': '200',
-            'format': 'json'
-        }
-        infoURL = 'https://en.wikipedia.org/w/api.php?' + urllib.parse.urlencode(infoParams)
-        with urllib.request.urlopen(urllib.request.Request(infoURL, headers=wikiHeaders)) as r:
-            pages = json.loads(r.read()).get('query', {}).get('pages', {})
+            imageURL = None
+            for page in pages.values():
+                infos = page.get('imageinfo', [])
+                if infos:
+                    imageURL = infos[0].get('thumburl') or infos[0].get('url')
+                    break
 
-        imageURL = None
-        for page in pages.values():
-            infos = page.get('imageinfo', [])
-            if infos:
-                imageURL = infos[0].get('thumburl') or infos[0].get('url')
-                break
+            if not imageURL:
+                continue
 
-        if not imageURL:
-            _team_logo_cache[teamName] = None
-            return None
+            with urllib.request.urlopen(urllib.request.Request(imageURL, headers=wikiHeaders)) as r:
+                imageBytes = r.read()
 
-        with urllib.request.urlopen(urllib.request.Request(imageURL, headers=wikiHeaders)) as r:
-            imageBytes = r.read()
+            img = mpimg.imread(io.BytesIO(imageBytes), format='png')
+            img = cropToContent(img)
+            _team_logo_cache[teamName] = img
+            return img
 
-        img = mpimg.imread(io.BytesIO(imageBytes), format='png')
-        img = cropToContent(img)
-        _team_logo_cache[teamName] = img
-        return img
+        _team_logo_cache[teamName] = None
+        return None
 
     except Exception as e:
         print(f"Error scraping logo for '{teamName}': {e}")
@@ -551,6 +581,40 @@ def drawFigureLine(page, color, y, x0=0.018, x1=0.982):
     """Draw a horizontal rule at figure coordinate y, spanning inside the primary border."""
     line = mlines.Line2D([x0, x1], [y, y], transform=page.transFigure, color=color, linewidth=3.0)
     page.add_artist(line)
+#%%
+def fitTextToWidth(page, textArtist, maxWidthFraction=0.94, minFontSize=11):
+    """Shrinks textArtist's font size until it fits within maxWidthFraction of the page
+    width, so a long value can't run past the page border.
+
+    Needed because these header lines are centered single lines built from scraped venue
+    names, which vary hugely in length: measured at fontsize 18, "LOWER.COM FIELD - GRASS
+    - COLUMBUS, OHIO" occupies 0.70 of the page width, but "ESTADIO OLIMPICO
+    UNIVERSITARIO - GRASS - MEXICO CITY, MEXICO" occupies 1.00 and overflows both edges.
+
+    Widths are measured against page.bbox.width rather than figsize*dpi: on a Retina
+    display the canvas carries a device_pixel_ratio of 2, so the raw window extent is
+    double what figsize*dpi predicts, and only the ratio against page.bbox is correct on
+    both kinds of display.
+
+    minFontSize is a floor — below it the text is left overflowing rather than shrunk to
+    something unreadable, on the grounds that a visibly wrong layout is easier to notice
+    and fix than silently illegible text.
+    """
+    try:
+        renderer = page.canvas.get_renderer()
+    except AttributeError:
+        # Not every matplotlib backend exposes a renderer before the figure is saved.
+        # Fail open: leave the text at its requested size rather than crashing the report.
+        return textArtist
+
+    fontSize = textArtist.get_fontsize()
+    while fontSize > minFontSize:
+        if textArtist.get_window_extent(renderer).width / page.bbox.width <= maxWidthFraction:
+            break
+        fontSize -= 0.5
+        textArtist.set_fontsize(fontSize)
+
+    return textArtist
 #%%
 def fitBoxToAspect(imgShape, maxWidth, maxHeight):
     '''Returns (width, height) in figure-fraction units that preserve imgShape's aspect
@@ -567,6 +631,7 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
     teamName = team.replace('_', ' ')
     teamLogo = scrapeLogo(teamName)
     oppositionName = opposition.replace('_', ' ')
+    oppositionLogo = scrapeLogo(oppositionName)
     competitionName = targetMatch.get('tournament', {}).get('uniqueTournament', {}).get('name', 'Unknown Competition')
     competitionRound = (targetMatch.get('roundInfo', {}).get('name') or targetMatch.get('tournament', {}).get('groupName') or ('Group Stage' if targetMatch.get('tournament', {}).get('uniqueTournament', {}).get('hasRounds') else 'Regular Season'))
     kickoffTimestamp = targetMatch.get('startTimestamp')
@@ -645,8 +710,8 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
     # All measurements in pts; 1 pt = 1/72 inch.
     SEC_W = 6   # secondary border thickness in pts
     PRI_W = 5   # primary border thickness in pts
-    sx = SEC_W / (72 * 8.5)              # ≈ 0.00980 fig units
-    sy = SEC_W / (72 * 11)              # ≈ 0.00758 fig units
+    sx = SEC_W / (72 * 8.5)            # ≈ 0.00980 fig units
+    sy = SEC_W / (72 * 11)             # ≈ 0.00758 fig units
     px = (SEC_W + PRI_W) / (72 * 8.5)  # ≈ 0.01797 fig units
     py = (SEC_W + PRI_W) / (72 * 11)   # ≈ 0.01389 fig units
 
@@ -687,7 +752,9 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
         rightTargetX = 0.89
         rightTargetY = 0.9
         axRight = page.add_axes([(rightTargetX-(logoWidth/2)), (rightTargetY-(logoHeight/2)), logoWidth, logoHeight])
+        # TODO: Pick which logo to show
         axRight.imshow(teamLogo)
+        #axRight.imshow(oppositionLogo)
         axRight.axis('off')
 
     # Separator line below header (not drawn on the front page — see frontPage flag)
@@ -696,7 +763,7 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
 
     return page, teamColors
 #%%
-def generateMatchInfo(leagues, opposition, date, matches, targetMatch, page, teamColors):
+def generateMatchInfo(targetMatch, page, teamColors):
 
     kickoffTimestamp = targetMatch.get('startTimestamp')
     venueName = targetMatch.get('venue', {}).get('name')
@@ -735,9 +802,11 @@ def generateMatchInfo(leagues, opposition, date, matches, targetMatch, page, tea
     venueLocationDisplay = venueLocation.upper() if venueLocation.strip(', ') else 'LOCATION TBD'
 
     # Line 1: venue name and playing surface (e.g. "SCOTTS MIRACLE-GRO FIELD - GRASS")
-    page.text(0.5, 0.7925, f'{venueDisplay} - {venueSurface.upper()} - {venueLocationDisplay}', ha='center', fontsize=18)#, fontweight='bold')
+    venueLine = page.text(0.5, 0.7925, f'{venueDisplay} - {venueSurface.upper()} - {venueLocationDisplay}', ha='center', fontsize=18)
+    fitTextToWidth(page, venueLine)#, fontweight='bold')
     # Line 2: city/state and weather summary (e.g. "COLUMBUS, OHIO - SUNNY, FEELS LIKE 78°F, ...")
-    page.text(0.5, 0.760, f'{weather}', ha='center', fontsize=18)#, fontweight='bold')
+    weatherLine = page.text(0.5, 0.760, f'{weather}', ha='center', fontsize=18)#, fontweight='bold')
+    fitTextToWidth(page, weatherLine)
 
     drawFigureLine(page, teamColors[1], y=0.742)
 
@@ -806,10 +875,45 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
     secondaryFormation = topFormations[1][0] if len(topFormations) >= 2 else None
 
     import League_Power_Rankings
+    import Expected_Lineup_Temp_V2
 
     year = date.split('-')[2]
+
+    # leagues[0] is the FOCUS team's own league — for an opponent from a different
+    # competition (e.g. a Leagues Cup opponent from Liga MX), that league's table never
+    # contains them, so Table Position/Power Ranking always fell through to N/A. Resolve
+    # the opponent's own real competition instead. `matches` above is scoped to whatever
+    # `leagues` the caller passed, which for a genuinely cross-competition opponent may
+    # not include their real league at all (that's the whole problem), so scan every
+    # locally scraped league directly for the opponent's own folder instead of relying
+    # on `matches` — same helper `scrapeTargetMatchData` uses, just given every local
+    # league instead of only the caller-provided ones.
+    leaguesRoot = f'/Users/jakeholfinger/Desktop/CC Analyst/Data/SofaScore_Data/{year}_Data'
+    allLocalLeagues = []
+    if os.path.exists(leaguesRoot):
+        allLocalLeagues = [f.removesuffix('_Data').replace('_', ' ') for f in getFiles(leaguesRoot)
+                            if os.path.isdir(os.path.join(leaguesRoot, f))]
+    oppositionID = findOppositionTeamID(allLocalLeagues, opposition, year)
+
+    leagueForRankings = leagues[0]
+    if oppositionID is not None:
+        oppositionCompetitions, _ = Expected_Lineup_Temp_V2.scrapeOppositionCompetitions([oppositionID])
+        liveCompetition = oppositionCompetitions[0] if oppositionCompetitions else None
+        if liveCompetition:
+            # SofaScore's primaryUniqueTournament can lag behind what's actually been
+            # scraped locally — confirmed live for Atlas FC: it reports "Liga MX,
+            # Clausura" (last season) while only "Liga MX, Apertura" (current season)
+            # exists on disk. Match on the league name before any comma-separated
+            # season/stage suffix against what's actually there, rather than requiring
+            # an exact string match that a stale live value would never satisfy.
+            liveLeaguePrefix = liveCompetition.split(',')[0].strip()
+            for localLeagueName in allLocalLeagues:
+                if localLeagueName.split(',')[0].strip() == liveLeaguePrefix:
+                    leagueForRankings = localLeagueName
+                    break
+
     with open(os.devnull, 'w') as f, contextlib.redirect_stdout(f):
-        result = League_Power_Rankings.main(year, leagues[0], len(matches), table=True)
+        result = League_Power_Rankings.main(year, leagueForRankings, len(matches), table=True)
 
     if result is None:
         powerRanking = 'N/A'
@@ -827,7 +931,7 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
 
     # --- MATCH OVERVIEW SECTION ---
     # Section title — centered
-    page.text(0.5, 0.700, 'TEAM OVERVIEW', ha='center', fontsize=27.5, fontweight='bold')
+    page.text(0.5, 0.700, 'OPPOSITION OVERVIEW', ha='center', fontsize=27.5, fontweight='bold')
 
     # Left column (x=0.048): league table, power ranking, form, expected points
     page.text(0.048, 0.660, f'Table Position: {standing}', fontsize=18)
@@ -890,13 +994,31 @@ def getShapeCoordinates(slots):
     needing the raw formation string.'''
     defSlots = {s for s in slots if s in ('DR', 'DCR', 'DC', 'DCL', 'DL')}
     if 'DC' in defSlots and 'DR' in defSlots and 'DL' in defSlots:
-        return POSITION_COORDINATES_5BACK
+        table = POSITION_COORDINATES_5BACK
     elif 'DC' in defSlots:
-        return POSITION_COORDINATES_3BACK
+        table = POSITION_COORDINATES_3BACK
     else:
-        return POSITION_COORDINATES_4BACK
+        table = POSITION_COORDINATES_4BACK
+
+    # A genuine central trio (MC present) needs wider spacing than the shared table
+    # gives it — MC/MCR/MCL are only 13 units apart there, but each card is CW=20 units
+    # wide (see below), so they overlap by 7 units on each side. The safe spread depends
+    # on whether wide ML/MR are also in the same row:
+    if 'MC' in slots:
+        table = dict(table)
+        _, y = table['MCR']
+        if 'ML' in slots or 'MR' in slots:
+            # Trio + full wide mid (3-5-2): 5 cards need to share the row, so all five
+            # get spaced exactly CW=20 apart, centered on 50.
+            table['ML'], table['MCL'], table['MC'] = (10, y), (30, y), (50, y)
+            table['MCR'], table['MR'] = (70, y), (90, y)
+        else:
+            # Trio only, no wide mid competing for the row (4-3-3, 4-3-1-2, 5-3-2) —
+            # spread into the unused wide space instead of the tight shared-table gap.
+            table['MCR'], table['MCL'] = (75, y), (25, y)
+    return table
 #%%
-def generatePredictedLineup(leagues, opposition, date, matches, page, formationOverride=False):
+def generatePredictedLineup(leagues, opposition, date, page, formationOverride=False):
 
     import Expected_Lineup_Temp_V2
 
@@ -930,6 +1052,12 @@ def generatePredictedLineup(leagues, opposition, date, matches, page, formationO
                           [['index', 'Availibility', 'Slot']]
                           .rename(columns={'index': 'Player', 'Slot': 'Position'}))
         missingPlayers['Avg Rating'] = missingPlayers['Player'].map(avgPlayerRatings).fillna('N/A')
+        # Cap the displayed list so it can't outgrow the table's allocated space — sort by
+        # Avg Rating first so a truncation drops the least-impactful absences, not whoever
+        # happened to come last from the API.
+        missingPlayers = missingPlayers.sort_values(
+            by='Avg Rating', key=lambda s: pd.to_numeric(s, errors='coerce'), ascending=False, na_position='last'
+        ).head(8)
     else:
         missingPlayers = pd.DataFrame()
 
@@ -1040,9 +1168,9 @@ def generatePredictedLineup(leagues, opposition, date, matches, page, formationO
         reducedExpectedSubs = expectedSubs[['Player', 'Slot', 'Sub %', 'Avg Match Rating']].rename(columns={'Slot': 'Position', 'Avg Match Rating': 'Avg Rating'})
         #subsAx = page.add_axes([0.55, 0.14, 0.40, 0.45])
         tableWidth = 0.425
-        tableHeight = 0.4
+        tableHeight = 0.16
         targetX = 0.725
-        targetY = 0.335
+        targetY = 0.369
         subsAx = page.add_axes([(targetX-(tableWidth/2)), (targetY-(tableHeight/2)), tableWidth, tableHeight])
 
         subsAx.axis('off')
@@ -1052,23 +1180,34 @@ def generatePredictedLineup(leagues, opposition, date, matches, page, formationO
             loc='center', cellLoc='center'
         )
         subsTable.auto_set_font_size(False)
-        subsTable.set_fontsize(10)
+        subsTable.set_fontsize(9)
         subsTable.auto_set_column_width(col=list(range(len(reducedExpectedSubs.columns))))
-        subsTable.scale(1, 2)
+        subsTable.scale(1, 1.5)
         # Make the cell borders transparent
         for (row, col), cell in subsTable.get_celld().items():
-            cell.set_linewidth(0)        
+            cell.set_linewidth(0)
             cell.set_edgecolor('none')
 
-    page.text(0.75,  0.20, 'Potential Absences', ha='center', fontsize=22.5, fontweight='bold')
+    page.text(0.75,  0.257, 'Potential Absences', ha='center', fontsize=22.5, fontweight='bold')
 
-    # Absences table: narrow axes in the bottom-right of the Personnel section.
+    # Absences table: narrow axes in the bottom-right of the Personnel section. missingPlayers
+    # is already capped (see above) so this table's rendered height (row-count-driven, not
+    # tableHeight below) can't outgrow the space reserved for it here.
     if isinstance(missingPlayers, pd.DataFrame) and not missingPlayers.empty:
         #absAx = page.add_axes([0.50, -0.05, 0.45, 0.35])
         tableWidth = 0.40
-        tableHeight = 0.325
+        tableHeight = 0.22
         targetX = 0.74
-        targetY = 0.12
+        # ax.table(loc='center') centers itself on the axes regardless of tableHeight above,
+        # and its actual rendered height is row-count-driven (~0.02273 figure-fraction per
+        # row at fontsize=9/scale(1,1.5)) — centering on a fixed targetY would make the
+        # table's TOP edge drift depending on how many players are missing. Anchor the TOP
+        # instead (fixed distance below the header, matching the tuned 8-row-cap case) and
+        # work backward to the center targetY this specific row count needs.
+        absencesTableTop = 0.2439
+        perRowHeight = 0.02273
+        actualTableHeight = (len(missingPlayers) + 1) * perRowHeight
+        targetY = absencesTableTop - actualTableHeight / 2
         absAx = page.add_axes([(targetX-(tableWidth/2)), (targetY-(tableHeight/2)), tableWidth, tableHeight])
 
         absAx.axis('off')
@@ -1078,15 +1217,20 @@ def generatePredictedLineup(leagues, opposition, date, matches, page, formationO
             loc='center', cellLoc='center'
         )
         absTable.auto_set_font_size(False)
-        absTable.set_fontsize(10)
+        absTable.set_fontsize(9)
         absTable.auto_set_column_width(col=list(range(len(missingPlayers.columns))))
-        absTable.scale(1, 2)
+        absTable.scale(1, 1.5)
         # Make the cell borders transparent
         for (row, col), cell in absTable.get_celld().items():
             cell.set_linewidth(0)        
             cell.set_edgecolor('none') 
 
-    return page
+    # expectedLineup/expectedSubs are returned, not just used locally, so page three's key
+    # pass legend can grey players who aren't expected to feature. Passing them down is
+    # deliberate rather than letting that chart call Expected_Lineup_Temp_V2.main again:
+    # that call is a network scrape plus an ILP solve, and with formationOverride=True it
+    # blocks on input() — a second call would prompt for the formation twice per report.
+    return page, expectedLineup, expectedSubs
 #%%
 def generateFirstPage(leagues, team, opposition, date, matches, targetMatch, formationOverride=False):
 
@@ -1094,23 +1238,88 @@ def generateFirstPage(leagues, team, opposition, date, matches, targetMatch, for
 
     # Fixed: was passing (leagues, team, opposition, date, matches, page) which
     # swapped 'team' in as 'opposition' and omitted targetMatch entirely.
-    page = generateMatchInfo(leagues, opposition, date, matches, targetMatch, page, teamColors)
+    page = generateMatchInfo(targetMatch, page, teamColors)
 
     page = generateMatchOverview(leagues, opposition, date, matches, page, teamColors)
 
-    page = generatePredictedLineup(leagues, opposition, date, matches, page, formationOverride=formationOverride)
+    page, expectedLineup, expectedSubs = generatePredictedLineup(leagues, opposition, date, page, formationOverride=formationOverride)
 
-    return page
+    return page, expectedLineup, expectedSubs
 
 #%%
-def main(leagues=['MLS'], team='New_York_City_FC', opposition='Columbus_Crew', date='7-22-2026', formationOverride=True):
+def generateSecondPage(leagues, team, opposition, targetMatch, date):
+
+    page, teamColors = generatePageTemplate(team, opposition, targetMatch)
+
+    import Tactical_Visualizations
+
+    # The report scouts the opposition (like the first page). The passed-in
+    # `matches` is the focus team's data, so reload the opposition's own history
+    # and pass `opposition` — otherwise the build-out map shows the wrong team's
+    # goalkeeper (and excludes the wrong team from the league baseline).
+    oppositionMatches = loadMatchData(leagues, opposition, date)
+
+    page, gkNotesBbox = Tactical_Visualizations.generate_relative_gk_pass_map(leagues, opposition, oppositionMatches, date, teamColors, page)
+
+    page, defActionNotesBbox = Tactical_Visualizations.generate_defensive_action_map(leagues, opposition, oppositionMatches, date, teamColors, page)
+
+    page, buildupNotesBbox = Tactical_Visualizations.generate_buildup_turnover_map(leagues, opposition, oppositionMatches, date, teamColors, page)
+
+    page, pressingNotesBbox = Tactical_Visualizations.generate_pressing_turnover_map(leagues, opposition, oppositionMatches, date, teamColors, page)
+
+    # Each chart function draws an empty bordered placeholder box for its notes field but
+    # can't make it interactive itself (matplotlib has no notion of a fillable PDF form
+    # field) — the (name, bbox) pairs collected here get turned into real AcroForm fields
+    # in a post-processing pass over the finished PDF, in main(). A chart with no data
+    # (empty league/team data) skips its own box and returns None instead of a bbox.
+    notesFields = [
+        ('gk_pass_notes', gkNotesBbox),
+        ('def_action_notes', defActionNotesBbox),
+        ('buildup_turnover_notes', buildupNotesBbox),
+        ('pressing_turnover_notes', pressingNotesBbox)
+    ]
+    notesFields = [(name, bbox) for name, bbox in notesFields if bbox is not None]
+
+    return page, notesFields
+
+#%%
+def generateThirdPage(leagues, team, opposition, targetMatch, date, expectedLineup=None, expectedSubs=None):
+
+    page, teamColors = generatePageTemplate(team, opposition, targetMatch)
+    
+    import Tactical_Visualizations
+
+    # The report scouts the opposition (like the first page). The passed-in
+    # `matches` is the focus team's data, so reload the opposition's own history
+    # and pass `opposition` — otherwise the build-out map shows the wrong team's
+    # goalkeeper (and excludes the wrong team from the league baseline).
+    oppositionMatches = loadMatchData(leagues, opposition, date)
+
+    page, keyPassNotesBbox = Tactical_Visualizations.generate_key_pass_map(
+        oppositionMatches, teamColors, page, expected_lineup=expectedLineup, expected_subs=expectedSubs)
+
+    # Distinct variable from the call above — reusing keyPassNotesBbox would silently
+    # discard the offensive chart's notes field, leaving its box drawn on the page but
+    # never turned into a real fillable form field.
+    page, defKeyPassNotesBbox = Tactical_Visualizations.generate_def_key_pass_map(leagues, opposition, oppositionMatches, date, teamColors, page)
+
+    notesFields = [
+        ('key_pass_notes', keyPassNotesBbox),
+        ('def_key_pass_notes', defKeyPassNotesBbox)
+    ]
+    notesFields = [(name, bbox) for name, bbox in notesFields if bbox is not None]
+
+    return page, notesFields
+#%%
+def main(leagues=['MLS', 'Leagues_Cup', 'US Open Cup'], team='Columbus_Crew', opposition='Charlotte_FC', date='8-15-2026', formationOverride=False):
     # Note: first value of leagues must be the opposition's primary league
     # formationOverride: pass a boolean that determines whether the deduced formation should be used or the user should input it
     # Note: date format is 'M-D-YYYY'
 
+    
     matches = loadMatchData(leagues, team, date)
 
-    targetMatch = scrapeTargetMatchData(opposition, date, matches)
+    targetMatch = scrapeTargetMatchData(leagues, opposition, date)
     if targetMatch is None:
         print(f'Could not retrieve match data for {opposition} on {date}. Aborting report.')
         return
@@ -1119,9 +1328,31 @@ def main(leagues=['MLS'], team='New_York_City_FC', opposition='Columbus_Crew', d
     os.makedirs(outputDir, exist_ok=True)
     outputPath = os.path.join(outputDir, f'Pre_Match_Report_{opposition}_{date}.pdf')
     with PdfPages(outputPath) as pdf:
-        pageOne = generateFirstPage(leagues, team, opposition, date, matches, targetMatch, formationOverride=formationOverride)
+        pageOne, expectedLineup, expectedSubs = generateFirstPage(leagues, team, opposition, date, matches, targetMatch, formationOverride=formationOverride)
         pdf.savefig(pageOne)
         plt.close(pageOne)
+
+        pageTwo, notesFieldsTwo = generateSecondPage(leagues, team, opposition, targetMatch, date)
+        pdf.savefig(pageTwo)
+        plt.close(pageTwo)
+
+        pageThree, notesFieldsThree = generateThirdPage(leagues, team, opposition, targetMatch, date,
+                                                        expectedLineup=expectedLineup, expectedSubs=expectedSubs)
+        pdf.savefig(pageThree)
+        plt.close(pageThree)
+
+    # matplotlib/PdfPages only produces flattened, static PDF content — turning the
+    # notes placeholder boxes into real clickable/editable fields requires a separate
+    # post-processing pass over the finished file (see PDF_Form_Fields.py). Each page's
+    # fields are applied in their own call, since add_fillable_text_fields only targets
+    # one page_index at a time — page two's fields would otherwise get silently dropped
+    # (and page three's misapplied onto page two) if both were collapsed into one
+    # notesFields variable.
+    import PDF_Form_Fields
+    if notesFieldsTwo:
+        PDF_Form_Fields.add_fillable_text_fields(outputPath, page_index=1, fields=notesFieldsTwo)
+    if notesFieldsThree:
+        PDF_Form_Fields.add_fillable_text_fields(outputPath, page_index=2, fields=notesFieldsThree)
 
     print(f'Report saved to {outputPath}')
 

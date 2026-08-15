@@ -234,21 +234,23 @@ CENTROIDS = {
     'Low Block':          [0.28, 0.08, 0.42, 0.22, 0.28],
 }
 
+def rank_centroids(vector):
+    '''Returns archetype names ordered nearest-first by Euclidean distance from
+    `vector` to each CENTROIDS entry.'''
+    centroid_distances = {
+        archetype: np.linalg.norm(vector - np.array(centroid_vector))
+        for archetype, centroid_vector in CENTROIDS.items()
+    }
+    return sorted(centroid_distances, key=centroid_distances.get)
+
 def classify_matches(df):
 
     axis_cols = ['possession_score', 'defense_score', 'direct_score', 'transition_score', 'width_score']
     archetypes = []
 
     for __, match in df[axis_cols].iterrows():
-
         team_vector = match.values.astype(float)
-
-        centroid_distances = {
-            archetype: np.linalg.norm(team_vector - np.array(centroid_vector))
-            for archetype, centroid_vector in CENTROIDS.items()
-        }
-
-        archetypes.append(min(centroid_distances, key=centroid_distances.get))
+        archetypes.append(rank_centroids(team_vector)[0])
 
     df = df.copy()
     df['archetype'] = archetypes
@@ -271,10 +273,17 @@ def classify_team_style(df, half_life=5):
     weighted_axis_scores = (df[axis_cols].multiply(df['weight'], axis=0)).sum() / df['weight'].sum()
     team_style_dict['axis_scores'] = weighted_axis_scores.to_dict()
 
-    # Weighted archetype
-    weighted_archetypes = df.groupby('archetype')['weight'].sum().sort_values(ascending=False)
-    team_style_dict['primary_archetype'] = weighted_archetypes.index[0]
-    team_style_dict['secondary_archetype'] = weighted_archetypes.index[1]
+    # Primary/secondary archetype = nearest/second-nearest centroid to the team's own
+    # recency-weighted average profile (weighted_axis_scores above) — not a plurality
+    # vote across individual match labels. A vote lets a team's archetype get decided
+    # by whichever bucket its noisier/less-representative matches happen to cluster
+    # into (e.g. several matches split across possession-flavored archetypes while a
+    # smaller set consistently lands in one defense-flavored one), even when that
+    # bucket isn't close to the team's actual average — voting was also fully
+    # disconnected from weighted_axis_scores despite both being computed here.
+    ranked_archetypes = rank_centroids(weighted_axis_scores.values.astype(float))
+    team_style_dict['primary_archetype'] = ranked_archetypes[0]
+    team_style_dict['secondary_archetype'] = ranked_archetypes[1]
 
     # Weighted archetype consistency
     team_style_dict['primary_archetype_consistency'] = (df['archetype'] == team_style_dict['primary_archetype']).mean()

@@ -320,7 +320,7 @@ def ScrapeDataType(homeTeamMatchFolderPath, awayTeamMatchFolderPath, dataType, m
         dataframe = pd.json_normalize(dataList)
 
         #Filter relevant columns
-        dataframe = dataframe.reindex(columns=['id', 'customID', 'attendence', 'hasGlobalHighlights', 'hasXg', 'hasEventPlayerStatistics', 'hasEventPlayerHeatMap', 'crowadsourcingDataDisplayEnabled', 'awayRedCards', 'slug', 'startTimestamp', 'finalResultOnly', 'cupMatchesInRound', 'seasonStatisticsType', 'roundInfo.name', 'roundInfo.round', 'roundInfo.cupRoundType', 'tournament.name', 'tournament.id', 'tournament.slug', 'tournament.category.name', 'tournament.category.id', 'tournament.uniqueTournament.name', 'tournament.uniqueTournament.id', 'tournament.uniqueTournament.primaryColorHex', 'tournament.uniqueTournament.secondaryColorHex', 'tournament.uniqueTournament.hasRounds', 'tournament.uniqueTournament.hasPerformanceGraphFeature', 'tournament.uniqueTournament.hasEventPlayerStatistics', 'tournament.uniqueTournament.displayInverseHomeAwayTeams', 'tournament.competitionType', 'tournament.isGroup', 'season.name', 'season.year', 'season.id', 'status.type', 'venue.venueCoordinates.latitude', 'venue.venueCoordinates.longitude', 'venue.name', 'venue.capacity', 'venue.country.name', 'venue.id', 'venue.city.name', 'referee.name', 'referee.yellowCards', 'referee.redCards', 'referee.yellowRedCards', 'referee.games', 'referee.country.name', 'referee.id', 'homeTeam.name', 'homeTeam.manager.name', 'homeTeam.manager.country.name', 'homeTeam.manager.id', 'homeTeam.national', 'homeTeam.id', 'homeTeam.fullName', 'homeTeam.nameCode', 'homeTeam.teamColors.primary', 'homeTeam.teamColors.secondary', 'homeTeam.teamColors.text','homeTeam.foundationDateTimestamp', 'awayTeam.name', 'awayTeam.manager.name', 'awayTeam.manager.country.slug', 'awayTeam.manager.id', 'awayTeam.venue.venueCoordinates.latitude', 'awayTeam.venueCoordinates.longitude', 'awayTeam.venue.name', 'awayTeam.venue.capacity', 'awayTeam.venue.country.name', 'awayTeam.venue.id', 'awayTeam.venue.city.name', 'awayTeam.nameCode', 'awayTeam.national', 'awayTeam.country.name', 'awayTeam.id', 'awayTeam.fullName', 'awayTeam.teamColors.primary', 'awayTeam.teamColors.secondary', 'awayTeam.teamColors.text', 'awayTeam.foundationDateTimestamp', 'homeScore.display', 'homeScore.period1', 'homeScore.period2', 'homeScore.normalTime', 'homeScore.extra1', 'homeScore.extra2', 'homeScore.overtime', 'homeScore.penalties', 'awayScore.display', 'awayScore.period1', 'awayScore.period2', 'awayScore.normalTime', 'awayScore.extra1', 'awayScore.extra2', 'awayScore.overtime', 'awayScore.penalties', 'aggregatedWinnerCode', 'winnerCode', 'time.injuryTime1', 'time.injuryTime2'])
+        dataframe = dataframe.reindex(columns=['id', 'customID', 'attendence', 'hasGlobalHighlights', 'hasXg', 'hasEventPlayerStatistics', 'hasEventPlayerHeatMap', 'crowadsourcingDataDisplayEnabled', 'awayRedCards', 'slug', 'startTimestamp', 'finalResultOnly', 'cupMatchesInRound', 'seasonStatisticsType', 'defaultPeriodLength', 'defaultOvertimeLength', 'roundInfo.name', 'roundInfo.round', 'roundInfo.cupRoundType', 'tournament.name', 'tournament.id', 'tournament.slug', 'tournament.category.name', 'tournament.category.id', 'tournament.uniqueTournament.name', 'tournament.uniqueTournament.id', 'tournament.uniqueTournament.primaryColorHex', 'tournament.uniqueTournament.secondaryColorHex', 'tournament.uniqueTournament.hasRounds', 'tournament.uniqueTournament.hasPerformanceGraphFeature', 'tournament.uniqueTournament.hasEventPlayerStatistics', 'tournament.uniqueTournament.displayInverseHomeAwayTeams', 'tournament.competitionType', 'tournament.isGroup', 'season.name', 'season.year', 'season.id', 'status.type', 'venue.venueCoordinates.latitude', 'venue.venueCoordinates.longitude', 'venue.name', 'venue.capacity', 'venue.country.name', 'venue.id', 'venue.city.name', 'referee.name', 'referee.yellowCards', 'referee.redCards', 'referee.yellowRedCards', 'referee.games', 'referee.country.name', 'referee.id', 'homeTeam.name', 'homeTeam.manager.name', 'homeTeam.manager.country.name', 'homeTeam.manager.id', 'homeTeam.national', 'homeTeam.id', 'homeTeam.fullName', 'homeTeam.nameCode', 'homeTeam.teamColors.primary', 'homeTeam.teamColors.secondary', 'homeTeam.teamColors.text','homeTeam.foundationDateTimestamp', 'awayTeam.name', 'awayTeam.manager.name', 'awayTeam.manager.country.slug', 'awayTeam.manager.id', 'awayTeam.venue.venueCoordinates.latitude', 'awayTeam.venueCoordinates.longitude', 'awayTeam.venue.name', 'awayTeam.venue.capacity', 'awayTeam.venue.country.name', 'awayTeam.venue.id', 'awayTeam.venue.city.name', 'awayTeam.nameCode', 'awayTeam.national', 'awayTeam.country.name', 'awayTeam.id', 'awayTeam.fullName', 'awayTeam.teamColors.primary', 'awayTeam.teamColors.secondary', 'awayTeam.teamColors.text', 'awayTeam.foundationDateTimestamp', 'homeScore.display', 'homeScore.period1', 'homeScore.period2', 'homeScore.normalTime', 'homeScore.extra1', 'homeScore.extra2', 'homeScore.extra3', 'homeScore.extra4', 'homeScore.overtime', 'homeScore.penalties', 'awayScore.display', 'awayScore.period1', 'awayScore.period2', 'awayScore.normalTime', 'awayScore.extra1', 'awayScore.extra2', 'awayScore.overtime', 'awayScore.penalties', 'aggregatedWinnerCode', 'winnerCode', 'time.injuryTime1', 'time.injuryTime2'])
 
         # Fall back to the home team's stadium when the event has no venue.
         # json_normalize yields NaN (not None) for missing values, homeTeam sits under
@@ -1014,7 +1014,7 @@ def RunScraper(booleans, leagueNames, years, dataTypes):
 
         #Define dates to scrape (Example: 2026-03-20)
         today = date.today()
-        dates = ['2026-04-29', today.strftime('%Y-%m-%d')]
+        dates = ['2026-07-31', today.strftime('%Y-%m-%d')]
 
         #If the league database should be cleared or it doesn't exist, create an empty file there
         if booleans['clearLeaguesDatabase'] or not os.path.exists(databasePath):
@@ -1125,7 +1125,7 @@ booleans = {}
 booleans['overwriteMatchFiles'] = False
 
 #Determines whether only matches without all files should be scraped
-booleans['onlyScrapeIncompleteMatches'] = True
+booleans['onlyScrapeIncompleteMatches'] = False
 
 #Determines whether only new matches should be scraped (only scrapes games that don't have a folder)
 booleans['onlyScrapeNewMatches'] = False
@@ -1145,8 +1145,8 @@ booleans['scrapeMatches'] = True
 #DEFINE VARIABLES
 
 #AllFileNames = ['Average_Positions.csv', 'First_Half_Team_Statistics.csv', 'Formations.csv', 'Full_Team_Statistics.csv', 'Match_Attributes.csv', 'Goalkeeper_Spatial_Points.csv', 'Match_Momentum.csv', 'Missing_Players.csv', 'Player_Event_Data.csv', 'Player_Heatmaps.csv', 'Player_Spatial_Points.csv', 'Player_Statistics.csv', 'Second_Half_Team_Statistics.csv', 'Shot_Map.csv', 'Subs_Average_Positions.csv']
-#leagueNames = ['MLS']
-leagueNames = ['MLS', 'US Open Cup']
+#leagueNames = ['MLS', 'Liga MX, Apertura', 'Leagues Cup']
+leagueNames = ['Leagues Cup']
 #leagueNames = ['USL Championship', 'USL League One']
 
 #AllYears = ['2010', '2011', '2012', '2013', '2014', '2015', '2016', '2017, '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025', '2026']
