@@ -13,6 +13,7 @@ from pulp import LpProblem, LpMaximize, LpVariable, LpBinary, lpSum, PULP_CBC_CM
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 import contextlib
+import sys
 from datetime import date, datetime, timezone, timedelta
 # %%
 def GetFiles(currentPath):
@@ -908,7 +909,12 @@ def computeStartingProbabilities(df, predictedMatchIDs, verbose=True):
 
     validationProbabilities = valModel.predict_proba(xValidation)[:, 1]
     if verbose:
-        print(f'Validation Log Loss: {log_loss(yValidation, validationProbabilities)}')
+        # labels=[0, 1] stated explicitly rather than inferred from yValidation. This is a
+        # BINARY classifier, so the label set is known up front — but a thin history can hand the
+        # validation split a single class (a team with one scraped match has eleven rows and all
+        # of them started), and log_loss then raises "y_true contains only one label". Killing a
+        # prediction that already succeeded over a diagnostic print is the wrong trade.
+        print(f'Validation Log Loss: {log_loss(yValidation, validationProbabilities, labels=[0, 1])}')
         featureImportance = pd.DataFrame({'Feature': xTrainingTest.columns, 'Importance': valModel.feature_importances_}).sort_values('Importance', ascending=False)
         print(featureImportance.to_string())
 
@@ -1177,7 +1183,19 @@ def predictLineup(mainDF, probsDF, formation, team, opposition, home, verbose=Tr
 
     status = prob.solve(PULP_CBC_CMD(msg=0))
     if status != 1:
-        print(f'Warning: ILP solver could not find a valid lineup (status {status}). Check that enough eligible players are available for the given formation.')
+        # Say WHICH shortfall broke it, not just that something did. The usual cause is a squad
+        # list too thin or too lopsided to cover the formation — measured on Ohio State, SofaScore
+        # lists 12 players and NOT ONE of them a goalkeeper, so no XI containing a GK slot can be
+        # built however the rest are arranged.
+        #
+        # To stderr because generatePredictedLineup runs this whole module under
+        # contextlib.redirect_stdout(devnull) to hide its training chatter, and that would swallow
+        # the one line explaining why the report has no lineup on it.
+        available = probsDF['Position'].value_counts().to_dict() if 'Position' in probsDF.columns else {}
+        print(f'Warning: could not build a valid {formation} lineup (solver status {status}). '
+              f'{len(probsDF)} candidate(s) available by position: {available or "none"}. '
+              f'A squad list missing a position the formation requires — most often a goalkeeper — '
+              f'makes every arrangement infeasible.', file=sys.stderr)
         return pd.DataFrame()
 
     # Collect results
@@ -1473,6 +1491,16 @@ def computeSubstitutionProbabilities(df, predictedMatchIDs, predictedLineup, ver
     xFull = benchHistoricalDF[featureCols].copy()
     yFull = benchHistoricalDF['Substituted'].astype(int)
 
+    # A classifier needs to have seen both outcomes. On a thin history it may not have: with one
+    # scraped match every bench player either came on or none did, so 'Substituted' is constant
+    # and XGBClassifier refuses the fit with "Invalid classes inferred from unique values of `y`".
+    # Same handling as the empty-bench case just above — no sub predictions, report continues with
+    # the starting XI, which by this point has already been predicted successfully.
+    if yFull.nunique() < 2:
+        print('Every historical bench appearance has the same outcome, so there is nothing for the '
+              'sub-in model to learn from. Skipping substitution predictions.')
+        return pd.DataFrame()
+
     modelParams = dict(
         n_estimators=300,
         max_depth=5,
@@ -1486,12 +1514,16 @@ def computeSubstitutionProbabilities(df, predictedMatchIDs, predictedLineup, ver
         random_state=42,
     )
 
-    valModel = XGBClassifier(**modelParams)
-    valModel.fit(xTrain, yTrain)
-
-    if verbose and len(yVal) > 0:
+    # Fitted only when it will actually be reported, and only when the training split carries both
+    # outcomes. The 80/20 split by match can hand a single class to the training side even when the
+    # full set has both, and this model exists purely to print a validation figure — it must not be
+    # able to stop a prediction the final model below can still make.
+    if verbose and len(yVal) > 0 and yTrain.nunique() >= 2:
+        valModel = XGBClassifier(**modelParams)
+        valModel.fit(xTrain, yTrain)
         valPreds = valModel.predict_proba(xVal)[:, 1]
-        print(f'Sub-In Classifier - Validation Log-Loss: {log_loss(yVal, valPreds):.3f}')
+        # labels=[0, 1] for the reason given at the starter model's log_loss above.
+        print(f'Sub-In Classifier - Validation Log-Loss: {log_loss(yVal, valPreds, labels=[0, 1]):.3f}')
         featureImportance = pd.DataFrame({
             'Feature': xTrain.columns,
             'Importance': valModel.feature_importances_,
@@ -1622,6 +1654,23 @@ def main(leagues=['MLS'], team='Columbus_Crew', date=date.today().strftime('%m-%
     # Read Home/Opposition from the TARGET match's rows — iloc[0] on the full frame
     # (sorted by player ID) returned an arbitrary match's Home value
     targetMatchRows = mainDF[mainDF['Match ID'] == predictedMatchIDs[0]]
+
+    # Having a target match ID is NOT the same as having anything to predict with, and the guard
+    # above only checks the former. Every future-match row is built by pairing the fixture with
+    # SofaScore's squad endpoint (see scrapeNextMatches), so a team that endpoint returns no
+    # players for produces a target ID and zero rows carrying it — and `.iloc[0]` on the empty
+    # selection raised "single positional indexer is out-of-bounds".
+    #
+    # Not hypothetical, and not uniform within a competition: measured, DePaul Blue Demons returns
+    # 0 squad players while Ohio State Buckeyes returns 12 and Columbus Crew 29. Without a squad
+    # there is no set of candidates to pick eleven from, so the honest result is no prediction —
+    # which costs the report its lineup graphic, not the whole run.
+    if targetMatchRows.empty:
+        # stderr for the same reason the ILP warning uses it — see predictLineup.
+        print(f'No squad data for {team} — SofaScore lists no players for this team, so there is '
+              f'nobody to predict a lineup from. Skipping the predicted lineup.', file=sys.stderr)
+        return pd.DataFrame(), pd.DataFrame(), {}
+
     home = bool(targetMatchRows['Home'].iloc[0])
     opposition = targetMatchRows['Opposition'].iloc[0]
 

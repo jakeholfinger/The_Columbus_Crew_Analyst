@@ -42,25 +42,74 @@ def scrapeURLData(apiURL):
         'x-requested-with': '5d7735',
     }
 
-    response = None
     for attempt in range(3):
         try:
             response = requests.get(apiURL, headers=headers, impersonate="chrome120", timeout=30)
-            break
         except Exception as e:
             print(f"Request failed ({e}), retrying... attempt {attempt+1}")
-            time.sleep(5)
+            time.sleep(5 * 2 ** attempt)
+            continue
 
-    if response is None:
-        print(f"Failed to fetch {apiURL} after 3 attempts, skipping.")
-        return
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except Exception as e:
+                print(f"Failed to parse JSON from {apiURL}: {e}")
+                return None
 
+        # THE STATUS CODE HAS TO BE CHECKED BEFORE .json() IS TRUSTED. SofaScore's rejections come
+        # back as valid JSON — a 403 body is {"error": {"code": 403, "reason": "challenge"}} — so
+        # parsing without looking at the status returns a perfectly well-formed dict that carries
+        # no events. Callers then read that as "the fixture doesn't exist" and say so, which is how
+        # a blocked API surfaced as "No match found for Columbus Crew on 8-26-2026" several layers
+        # up, sending the reader looking for a scheduling problem that wasn't there.
+        reason = _responseReason(response)
+
+        # 403 is NOT retried, deliberately, even though it is the one most likely to be temporary.
+        # SofaScore serves it as reason="challenge" when it has decided a client looks automated,
+        # and the thing that provokes that is request volume — so retrying a challenge is pouring
+        # petrol on the fire. Fail fast, say why, and let the caller back off. 429 and 5xx ARE
+        # retried, since those are the server asking for patience rather than refusing outright.
+        retriable = response.status_code == 429 or response.status_code >= 500
+        if retriable and attempt < 2:
+            # Honour Retry-After when the server sends a usable one, otherwise back off
+            # exponentially. SofaScore has been observed sending a literal 0, which is not a
+            # sensible wait, so anything below the floor falls back to the computed delay.
+            computed = 5 * 2 ** attempt
+            try:
+                wait = max(float(response.headers.get('retry-after', 0)), computed)
+            except (TypeError, ValueError):
+                wait = computed
+            print(f"SofaScore returned {response.status_code} ({reason}) for {apiURL} — "
+                  f"retrying in {wait:.0f}s (attempt {attempt + 1}/3)")
+            time.sleep(min(wait, 60))
+            continue
+
+        note = ''
+        if response.status_code == 403:
+            note = ("  This is SofaScore refusing the request, not a missing fixture. reason="
+                    f"'{reason}' usually means their bot check has flagged this IP; it is commonly "
+                    "provoked by too many requests in a short window and commonly clears on its "
+                    "own after a quiet period.")
+        print(f"SofaScore returned {response.status_code} ({reason}) for {apiURL}, giving up.{note}")
+        return None
+
+    print(f"Failed to fetch {apiURL} after 3 attempts, skipping.")
+    return None
+
+def _responseReason(response):
+    '''The server's own words for why it refused, pulled out of the error body when there is one.
+
+    SofaScore answers a rejection with {"error": {"code": 403, "reason": "challenge"}}, and that
+    reason is the single most useful thing in the response — "challenge" and "Forbidden" mean
+    different things and point at different fixes.'''
     try:
-        dataJSON = response.json()
-    except Exception as e:
-        print(f"Failed to parse JSON from {apiURL}: {e}")
-        return
-    return dataJSON
+        body = response.json()
+    except Exception:
+        return (response.text or '').strip()[:80] or 'no body'
+    if isinstance(body, dict) and isinstance(body.get('error'), dict):
+        return body['error'].get('reason', 'unknown')
+    return 'unknown'
 #%%
 def loadMatchData(leagues, team, date):
     year = date.split('-')[2]
@@ -171,6 +220,10 @@ def scrapeTargetMatchData(leagues, opposition, date):
 
     foundMatch = False
     matchData = None
+    # Tracks whether any request came back empty-handed, so the "not found" message below can tell
+    # "this fixture isn't scheduled" apart from "we never got to ask". Those need opposite
+    # responses from a reader and used to print identically.
+    apiUnreachable = False
     for matchTimeframe in matchTimeframes:
         count = 0
         hasNextPage = True
@@ -178,6 +231,7 @@ def scrapeTargetMatchData(leagues, opposition, date):
             apiURL = f'https://www.sofascore.com/api/v1/team/{oppositionID}/events/{matchTimeframe}/{count}'
             data = scrapeURLData(apiURL)
             if data is None:
+                apiUnreachable = True
                 break
             # API returns {"events": [...], "hasNextPage": bool}
             for match in data.get('events', []):
@@ -202,7 +256,12 @@ def scrapeTargetMatchData(leagues, opposition, date):
             break
 
     if not foundMatch:
-        print(f'No match found for {oppositionName} on {date}')
+        if apiUnreachable:
+            print(f'Could not reach the SofaScore API while looking for {oppositionName} on {date} '
+                  f'— see the error above. The fixture may well exist; we never got a list to '
+                  f'search. Locally cached match data is unaffected.')
+        else:
+            print(f'No match found for {oppositionName} on {date}')
         return None
 
     return matchData
@@ -634,27 +693,13 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
     oppositionLogo = scrapeLogo(oppositionName)
     competitionName = targetMatch.get('tournament', {}).get('uniqueTournament', {}).get('name', 'Unknown Competition')
     competitionRound = (targetMatch.get('roundInfo', {}).get('name') or targetMatch.get('tournament', {}).get('groupName') or ('Group Stage' if targetMatch.get('tournament', {}).get('uniqueTournament', {}).get('hasRounds') else 'Regular Season'))
-    kickoffTimestamp = targetMatch.get('startTimestamp')
-    venueName = targetMatch.get('venue', {}).get('name')
-    venueTimezone = 'UTC'
-    if venueName:
-        _, _, tz, _, _, _ = scrapeCoordinatesAndTimezone(venueName)
-        if tz:
-            venueTimezone = tz
-
-    # Format kickoff time in the venue's local timezone and append the timezone abbreviation
-    if kickoffTimestamp is None:
-        kickoffTime = 'TBD'
-    else:
-        kickoffDt = datetime.fromtimestamp(kickoffTimestamp, tz=ZoneInfo('UTC')).astimezone(ZoneInfo(venueTimezone))
-        tzAbbrev = kickoffDt.strftime('%Z')     # e.g. "EST", "EDT", "CST"
-        kickoffTime = kickoffDt.strftime('%-m/%-d/%Y @ %-I:%M %p') + f' {tzAbbrev}'
-
     # Team colors live under homeTeam.teamColors / awayTeam.teamColors in the API response
     # Resolve which side the team is on. A one-way name check silently assumed 'away'
     # whenever the local name didn't exactly match SofaScore's, pulling the wrong team ID
     # and colors. Check both sides, then fall back to the opposition's side (its name
     # comes from the same SofaScore data, so if it matches one side the team is the other).
+    #
+    # Resolved BEFORE the kickoff time below, which needs it to pick out the team's own ground.
     homeAPITeamName = targetMatch.get('homeTeam', {}).get('name')
     awayAPITeamName = targetMatch.get('awayTeam', {}).get('name')
     if (teamName == homeAPITeamName) or (oppositionName == awayAPITeamName):
@@ -665,7 +710,48 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
         print(f'Warning: neither "{teamName}" nor "{oppositionName}" matches the API team names '
               f'("{homeAPITeamName}" vs "{awayAPITeamName}"). Assuming {teamName} is the away team.')
         isHome = False
-    # NOTE: Don't use sofascore's colors as they're 
+
+    kickoffTimestamp = targetMatch.get('startTimestamp')
+    matchVenueName = targetMatch.get('venue', {}).get('name')
+    # The team's OWN ground, which is what the header's primary time is expressed in — the report
+    # is read from the team's city, so "when does this kick off for us" is the question it should
+    # answer first. The API carries both sides' home grounds (homeTeam.venue / awayTeam.venue), so
+    # this is a lookup rather than a guess; it falls back to the match venue if the side's ground
+    # is missing, which reproduces the old behaviour rather than failing.
+    teamVenueName = (targetMatch.get('homeTeam' if isHome else 'awayTeam', {})
+                     .get('venue', {}).get('name')) or matchVenueName
+
+    def resolveTimezone(venue):
+        '''IANA zone for a venue, or None. Cached inside scrapeCoordinatesAndTimezone, so the
+        two lookups here cost one geocode each per distinct ground per session.'''
+        if not venue:
+            return None
+        _, _, tz, _, _, _ = scrapeCoordinatesAndTimezone(venue)
+        return tz
+
+    teamTimezone = resolveTimezone(teamVenueName) or 'UTC'
+    matchTimezone = resolveTimezone(matchVenueName) or teamTimezone
+
+    # Kickoff in the TEAM's timezone, with the venue's in brackets whenever the two differ — an
+    # away trip across a zone boundary is exactly when both numbers matter, and showing only one
+    # leaves a reader to work out which it was. The zone abbreviations distinguish them.
+    #
+    # The bracketed half is kept terse because this line is the widest thing in the header and it
+    # runs BETWEEN the two club logos, which sit at x=0.074-0.147 and x=0.854-0.927 — 0.707 of
+    # page width to play with. A spelled-out "(7:30 PM CDT at venue)" measured 0.788 wide and
+    # cleared the logos by 0.002 vertically, which is not clearance, it is luck.
+    if kickoffTimestamp is None:
+        kickoffTime = 'TBD'
+    else:
+        kickoffUTC = datetime.fromtimestamp(kickoffTimestamp, tz=ZoneInfo('UTC'))
+        teamKickoff = kickoffUTC.astimezone(ZoneInfo(teamTimezone))
+        # %Z gives the abbreviation with daylight saving already applied — "EDT" not "EST".
+        kickoffTime = teamKickoff.strftime('%-m/%-d/%Y @ %-I:%M %p %Z')
+        venueKickoff = kickoffUTC.astimezone(ZoneInfo(matchTimezone))
+        if venueKickoff.strftime('%Z') != teamKickoff.strftime('%Z'):
+            kickoffTime += venueKickoff.strftime(' (%-I:%M %p %Z)')
+
+    # NOTE: Don't use sofascore's colors as they're
     #teamKey = 'homeTeam' if isHome else 'awayTeam'
     #primaryColor   = '#' + (targetMatch.get(teamKey, {}).get('teamColors', {}).get('primary', '000000') or '000000').lstrip('#')
     #secondaryColor = '#' + (targetMatch.get(teamKey, {}).get('teamColors', {}).get('secondary', 'ffffff') or 'ffffff').lstrip('#')
@@ -942,7 +1028,16 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
     # Right column (x=0.500): tactical info
     page.text(0.450, 0.660, f'Primary Formation: {primaryFormation}', fontsize=18)
     page.text(0.450, 0.620, f'Secondary Formation: {secondaryFormation or "N/A"}', fontsize=18)
-    page.text(0.450, 0.580, f'Style Of Play: {styleOfPlay.get('primary_archetype') or "N/A"}', fontsize=18)
+    # styleOfPlay is None when the classifier had nothing to work with at all — a competition
+    # missing even the core files. When it DID classify but on partial data, it says so via
+    # 'limited', and that has to reach the page: an archetype built from 38% of the possession
+    # weight and one match should not read identically to one built on a full MLS season.
+    # See Indentify_Style_Of_Play.main for what goes into that flag.
+    archetype = styleOfPlay.get('primary_archetype') if styleOfPlay else None
+    styleLabel = archetype or 'N/A'
+    if archetype and styleOfPlay.get('limited'):
+        styleLabel += ' (limited data)'
+    page.text(0.450, 0.580, f'Style Of Play: {styleLabel}', fontsize=18)
     #page.text(0.500, 0.579, 'Win Probability: N/A', fontsize=22.5)
 
     drawFigureLine(page, teamColors[1], y=0.550)
@@ -1295,27 +1390,87 @@ def generateThirdPage(leagues, team, opposition, targetMatch, date, expectedLine
     # goalkeeper (and excludes the wrong team from the league baseline).
     oppositionMatches = loadMatchData(leagues, opposition, date)
 
-    page, keyPassNotesBbox = Tactical_Visualizations.generate_key_pass_map(
-        oppositionMatches, teamColors, page, expected_lineup=expectedLineup, expected_subs=expectedSubs)
+    page, keyPassNotesBbox, keyPassVmax = Tactical_Visualizations.generate_key_pass_map(
+        leagues, opposition, oppositionMatches, date, teamColors, page,
+        expected_lineup=expectedLineup, expected_subs=expectedSubs)
 
     # Distinct variable from the call above — reusing keyPassNotesBbox would silently
     # discard the offensive chart's notes field, leaving its box drawn on the page but
     # never turned into a real fillable form field.
-    page, defKeyPassNotesBbox = Tactical_Visualizations.generate_def_key_pass_map(leagues, opposition, oppositionMatches, date, teamColors, page)
+    page, defKeyPassNotesBbox = Tactical_Visualizations.generate_def_key_pass_map(
+        leagues, opposition, oppositionMatches, date, teamColors, page, shared_vmax=keyPassVmax)
+
+    # expectedLineup/expectedSubs are forwarded for the same reason generate_key_pass_map takes
+    # them: a player the model predicts to feature stays un-greyed in the player key however
+    # few minutes they have banked so far.
+    # shotVmax is the maximum ΣxG across BOTH directions, which only the offensive chart can see
+    # (it extracts the conceded frame for its own situation key). Handing it to the conceded chart
+    # puts the pair on one colour scale, so a solid cell means the same number on both.
+    page, shotNotesBbox, shotVmax = Tactical_Visualizations.generate_shot_map(
+        leagues, opposition, oppositionMatches, date, teamColors, page,
+        expected_lineup=expectedLineup, expected_subs=expectedSubs)
+
+    # Takes neither leagues/date nor the lineup prediction, unlike every call above it: those
+    # feed the situation key's league percentiles and the player key's greying rule, and the
+    # conceded chart has neither key. Its own notes variable for the same reason
+    # defKeyPassNotesBbox is distinct — reusing shotNotesBbox would leave one of the two boxes
+    # drawn on the page but never turned into a real fillable form field.
+    page, defShotNotesBbox = Tactical_Visualizations.generate_def_shot_map(
+        opposition, oppositionMatches, teamColors, page, shared_vmax=shotVmax)
 
     notesFields = [
         ('key_pass_notes', keyPassNotesBbox),
-        ('def_key_pass_notes', defKeyPassNotesBbox)
+        ('def_key_pass_notes', defKeyPassNotesBbox),
+        ('shot_notes', shotNotesBbox),
+        ('def_shot_notes', defShotNotesBbox)
     ]
     notesFields = [(name, bbox) for name, bbox in notesFields if bbox is not None]
 
     return page, notesFields
+
 #%%
-def main(leagues=['MLS', 'Leagues_Cup', 'US Open Cup'], team='Columbus_Crew', opposition='Charlotte_FC', date='8-15-2026', formationOverride=False):
+def generateFourthPage(leagues, team, opposition, targetMatch, date,
+                       expectedLineup=None, expectedSubs=None):
+    '''Set pieces. First pair: corners taken and corners conceded. The bottom half of the page is
+    deliberately left empty for the next set-piece pair.'''
+
+    page, teamColors = generatePageTemplate(team, opposition, targetMatch)
+
+    import Tactical_Visualizations
+
+    # The report scouts the opposition, as pages one and three do, so reload their own history.
+    oppositionMatches = loadMatchData(leagues, opposition, date)
+
+    # The two charts share ONE key column between them: there is no room for a text list to the
+    # right of the conceded chart, whose colourbar label already runs to x~0.95. The taken chart
+    # therefore hands back where its own stack ended, and the conceded chart hangs its defender
+    # list underneath — which is also why it must be drawn second.
+    # expectedLineup/expectedSubs are forwarded for the same reason page three's charts take
+    # them: a player the model predicts to feature stays un-greyed in the Taker and Corner Shot
+    # Threat keys however few minutes they have banked so far. See player_qualifier.
+    page, cornerNotesBbox, cornerKeyColumn, cornerVmax = Tactical_Visualizations.generate_corner_map(
+        leagues, opposition, oppositionMatches, date, teamColors, page,
+        expected_lineup=expectedLineup, expected_subs=expectedSubs)
+
+    page, defCornerNotesBbox = Tactical_Visualizations.generate_def_corner_map(
+        leagues, opposition, oppositionMatches, date, teamColors, page,
+        key_column=cornerKeyColumn, shared_vmax=cornerVmax,
+        expected_lineup=expectedLineup, expected_subs=expectedSubs)
+
+    notesFields = [
+        ('corner_notes', cornerNotesBbox),
+        ('def_corner_notes', defCornerNotesBbox)
+    ]
+    notesFields = [(name, bbox) for name, bbox in notesFields if bbox is not None]
+
+    return page, notesFields
+
+#%%
+def main(leagues=['Liga_MX,_Apertura', 'MLS', 'Leagues_Cup'], team='Columbus_Crew', opposition='Club_América', date='8-26-2026', formationOverride=False):
+#def main(leagues=['NCAA'], team='DePaul_Blue_Demons', opposition='Ohio_State_Buckeyes', date='8-24-2026', formationOverride=False):
     # Note: first value of leagues must be the opposition's primary league
     # formationOverride: pass a boolean that determines whether the deduced formation should be used or the user should input it
     # Note: date format is 'M-D-YYYY'
-
     
     matches = loadMatchData(leagues, team, date)
 
@@ -1341,6 +1496,11 @@ def main(leagues=['MLS', 'Leagues_Cup', 'US Open Cup'], team='Columbus_Crew', op
         pdf.savefig(pageThree)
         plt.close(pageThree)
 
+        pageFour, notesFieldsFour = generateFourthPage(leagues, team, opposition, targetMatch, date,
+                                                       expectedLineup=expectedLineup, expectedSubs=expectedSubs)
+        pdf.savefig(pageFour)
+        plt.close(pageFour)
+
     # matplotlib/PdfPages only produces flattened, static PDF content — turning the
     # notes placeholder boxes into real clickable/editable fields requires a separate
     # post-processing pass over the finished file (see PDF_Form_Fields.py). Each page's
@@ -1353,6 +1513,8 @@ def main(leagues=['MLS', 'Leagues_Cup', 'US Open Cup'], team='Columbus_Crew', op
         PDF_Form_Fields.add_fillable_text_fields(outputPath, page_index=1, fields=notesFieldsTwo)
     if notesFieldsThree:
         PDF_Form_Fields.add_fillable_text_fields(outputPath, page_index=2, fields=notesFieldsThree)
+    if notesFieldsFour:
+        PDF_Form_Fields.add_fillable_text_fields(outputPath, page_index=3, fields=notesFieldsFour)
 
     print(f'Report saved to {outputPath}')
 

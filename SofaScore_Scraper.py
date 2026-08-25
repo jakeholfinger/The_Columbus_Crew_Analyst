@@ -1014,7 +1014,7 @@ def RunScraper(booleans, leagueNames, years, dataTypes):
 
         #Define dates to scrape (Example: 2026-03-20)
         today = date.today()
-        dates = ['2026-07-31', today.strftime('%Y-%m-%d')]
+        dates = ['2026-08-20', today.strftime('%Y-%m-%d')]
 
         #If the league database should be cleared or it doesn't exist, create an empty file there
         if booleans['clearLeaguesDatabase'] or not os.path.exists(databasePath):
@@ -1134,7 +1134,7 @@ booleans['onlyScrapeNewMatches'] = False
 booleans['deleteAllExtraFiles'] = False
 
 #Determines whether league info should be updated
-booleans['scrapeLeaguesInfo'] = False
+booleans['scrapeLeaguesInfo'] = True
 
 #Determines whether the leagues database should be cleared
 booleans['clearLeaguesDatabase'] = False
@@ -1145,8 +1145,9 @@ booleans['scrapeMatches'] = True
 #DEFINE VARIABLES
 
 #AllFileNames = ['Average_Positions.csv', 'First_Half_Team_Statistics.csv', 'Formations.csv', 'Full_Team_Statistics.csv', 'Match_Attributes.csv', 'Goalkeeper_Spatial_Points.csv', 'Match_Momentum.csv', 'Missing_Players.csv', 'Player_Event_Data.csv', 'Player_Heatmaps.csv', 'Player_Spatial_Points.csv', 'Player_Statistics.csv', 'Second_Half_Team_Statistics.csv', 'Shot_Map.csv', 'Subs_Average_Positions.csv']
-#leagueNames = ['MLS', 'Liga MX, Apertura', 'Leagues Cup']
-leagueNames = ['Leagues Cup']
+#leagueNames = ['MLS', 'Liga MX, Apertura', 'Leagues Cup', 'US Open Cup']
+#leagueNames = ['MLS']
+leagueNames = ['NCAA']
 #leagueNames = ['USL Championship', 'USL League One']
 
 #AllYears = ['2010', '2011', '2012', '2013', '2014', '2015', '2016', '2017, '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025', '2026']
