@@ -139,12 +139,21 @@ CORNER_HEATMAP_BINS = (8, 6)
 # it over, the lever is the Player column width in situation_columns/player_columns, not this.
 SHOT_LEGEND_ANCHOR_X = 1.42
 
-# Left edge of every paired chart on the right half of a page (def key pass, def shot, def
-# corner) — constant across all three pairs. Every key in this file hangs off a LEFT-hand chart
-# and is auto-centred by stacked_legend() in the empty column between that chart's own right edge
-# and this x, so the value has to be a constant rather than measured: the sibling axes usually
-# doesn't exist yet when a left chart's own keys are being placed.
-RIGHT_CHART_X0 = 0.60
+# Page margin, and the centre every key column is aligned to.
+#
+# Every offence/defence pair in this report is now laid out symmetrically: the left chart starts
+# PAGE_MARGIN from the left edge and the right chart's cluster — its pitch, its colourbar and that
+# colourbar's rotated label — ends PAGE_MARGIN from the right edge. Measured rather than assumed,
+# by rendering each pair and reading back the full extent of both clusters (page three's run
+# 0.338 wide, page four's corners 0.298).
+#
+# The symmetry is what makes PAGE_CENTRE_X usable as the anchor for every key. Two clusters of
+# equal width, equally inset, leave a gap whose midpoint is the middle of the page whatever the
+# charts are — so a key column has one alignment to hit and no per-pair constant to drift out of
+# date. It replaces a hardcoded "the right chart starts at 0.60", which was true of three pairs
+# and would have been wrong for the two that moved.
+PAGE_MARGIN = 0.03
+PAGE_CENTRE_X = 0.5
 
 # Vertical gap, in axes fractions, between one of the shot map's stacked keys and the next.
 # Big enough to read as separate blocks rather than one run-on list, small enough to keep the
@@ -259,6 +268,77 @@ CORNER_MARKER_ALPHA = 0.85
 # the cropped pitch exactly, so there is no aspect-lock slack to derive an offset from. At the
 # top row's bbox[1]=0.525 this yields the 0.12-high box the rest of the report uses.
 CORNER_NOTES_Y0 = 0.375
+
+# --- Penalty maps (page four, bottom row) -------------------------------------------------
+# These charts do not sit on a pitch. Shot_Map.csv carries a SECOND coordinate frame,
+# goalMouthCoordinates.y/.z, which is where the ball crossed the goal PLANE — unrelated to the
+# playerCoordinates the rest of this file works in.
+#
+# The frame's extent is not documented anywhere, so it was measured against ground truth: every
+# shot recorded as a GOAL must by definition have crossed inside the posts and under the bar.
+# Across all 13,008 goals in the archive, y spans 45.3-54.8 and z spans 0.1-37.9, with the 99.9th
+# percentile of z at 36.2 — the handful above it are balls whose CENTRE crossed above the bar
+# line while the ball itself was still under it. Hence a frame of y 45.25-54.75 and z 0-36.
+PENALTY_GOAL_Y_MIN, PENALTY_GOAL_Y_MAX = 45.25, 54.75
+PENALTY_GOAL_Z_MIN, PENALTY_GOAL_Z_MAX = 0.0, 36.0
+
+# y AND z ARE NOT ON THE SAME SCALE, which is the whole reason this constant exists. A real goal
+# is 7.32m x 2.44m, so the measured extents above make one y-unit 7.32/9.5 = 0.771m and one
+# z-unit 2.44/36 = 0.0678m — an eleven-fold difference. Drawn at matplotlib's default aspect the
+# goal comes out nearly square, i.e. a shot under the bar reads as if it were a shot into the
+# top corner.
+#
+# set_aspect takes the ratio of a y-unit's height to an x-unit's width in DISPLAY space, so
+# feeding it 0.0678/0.771 renders both axes at the same metres-per-inch. Checked: the frame then
+# draws 9.5 x (36 * 0.0879) = 9.5 x 3.16, a 3.0:1 rectangle, against the real goal's 7.32:2.44 —
+# also 3.0:1. Applying the ratio to the axes is what mplsoccer's Pitch does internally for opta's
+# 100x100 frame; doing it directly avoids inventing a parallel "metres" unit for these two charts.
+GOAL_ASPECT = 0.0879
+
+# The drawn window, wider and taller than the goal so a near miss is visibly a near miss rather
+# than a mark pinned to the border. Fixed rather than fitted to each team's own spread, for the
+# reason SHOT_SIZE_MIN/MAX give: a window that resized per team would make the same placement sit
+# in a different part of two opponents' charts.
+#
+# Measured across all 1,292 penalties in the archive, this window shows 98.3%, and every one of
+# the 22 it clips is a `miss` — the widest sits at z=88.9, a ball sent into the stands. Stretching
+# it to hold them would shrink the goal to a sliver on every other report; tightening it is what
+# makes the goal fill 59% of the chart's width rather than the 53% a wider window left it. Any
+# clipped penalty is still counted in the keys, and generate_penalty_map prints when it happens,
+# so the number beside a player's name is never quietly larger than the marks on the chart.
+PENALTY_MAP_Y_MIN, PENALTY_MAP_Y_MAX = 42.0, 58.0
+PENALTY_MAP_Z_MIN, PENALTY_MAP_Z_MAX = -2.0, 42.0
+
+# Shape carries the OUTCOME here, on both charts. Every other encoding is spoken for — colour is
+# the taker (offence) or the keeper (defence), size is xGOT — and situation, which shape carries
+# on the shot map, is constant on a chart made only of penalties.
+#
+# Two categories rather than three. 'save' and 'miss' are kept apart in the data but not on the
+# mark: what a reader is scanning for is "did this one beat the keeper", and 208 saves against 52
+# genuine misses archive-wide means a third shape would be spent on a category most teams have
+# none of. The keys spell out that the triangle covers both.
+PENALTY_OUTCOME_MARKERS = {True: 'o', False: '^'}
+PENALTY_OUTCOME_LABELS = {True: 'Goal', False: 'Saved or missed'}
+
+# xGOT floor for the marker-size scale. Penalty xGOT does not use the bottom of the 0-1 range the
+# shot map's sizing assumes: on target it runs 0.582-0.992 (mean 0.83 for goals, 0.76 for saves),
+# and off target it is 0 by definition. Passed through shot_marker_area raw, every on-target
+# penalty came out between areas 40 and 58 — a radius difference of 17%, invisible in practice.
+#
+# Rescaling [0.5, 1.0] onto the full [0, 1] the size ramp expects spreads those same shots across
+# areas 23-58 instead. Off-target penalties clip to the floor and draw at SHOT_SIZE_MIN, which is
+# the honest reading: a penalty that never reached the target had no on-target threat.
+PENALTY_XGOT_FLOOR = 0.5
+
+# Page four's second-row notes boxes, stated outright rather than derived from the charts' bbox
+# the way the corner row's are. GOAL_ASPECT shrinks a penalty chart to about a quarter of the box
+# it is given — the frame is far wider than it is tall — so bbox[1] is nowhere near where the
+# chart actually ends and the corner row's `bbox[1] - 0.03` offset would leave a gaping hole.
+# Same reasoning SHOT_NOTES_Y0 already gives for fixing its own y. Height matches the rest of the
+# report's boxes.
+PENALTY_NOTES_Y0 = 0.045
+PENALTY_NOTES_HEIGHT = 0.12
+
 
 # How a goal is set apart. Colour, shape and size are all spoken for (player, situation, xG), so
 # what is left is the marker's outline or its fill pattern.
@@ -402,6 +482,100 @@ def crop_corner_map(ax, mirrored=False):
         ax.set_xlim(ax.get_xlim()[0], 100 - CORNER_MAP_X_MIN)
     else:
         ax.set_xlim(CORNER_MAP_X_MIN, ax.get_xlim()[1])
+
+def draw_goal_frame(ax):
+    '''Draw the goal itself — posts, bar and line — as the backdrop the penalty charts are read
+    against. The equivalent of pitch.draw() for these two, and like it, called again after
+    anything that resets the axes.
+
+    The net is drawn as a light grid rather than left blank so the eye has something to judge
+    "just inside the post" against; it is deliberately fainter than the frame, which is drawn in
+    the same #888888 the pitch lines use so the page reads as one set of charts.'''
+    for y in np.linspace(PENALTY_GOAL_Y_MIN, PENALTY_GOAL_Y_MAX, 9)[1:-1]:
+        ax.plot([y, y], [PENALTY_GOAL_Z_MIN, PENALTY_GOAL_Z_MAX],
+                color='#dddddd', linewidth=0.4, zorder=0)
+    for z in np.linspace(PENALTY_GOAL_Z_MIN, PENALTY_GOAL_Z_MAX, 5)[1:-1]:
+        ax.plot([PENALTY_GOAL_Y_MIN, PENALTY_GOAL_Y_MAX], [z, z],
+                color='#dddddd', linewidth=0.4, zorder=0)
+
+    # Posts and bar as one polyline, so the corners join cleanly.
+    ax.plot([PENALTY_GOAL_Y_MIN, PENALTY_GOAL_Y_MIN, PENALTY_GOAL_Y_MAX, PENALTY_GOAL_Y_MAX],
+            [PENALTY_GOAL_Z_MIN, PENALTY_GOAL_Z_MAX, PENALTY_GOAL_Z_MAX, PENALTY_GOAL_Z_MIN],
+            color='#888888', linewidth=1.4, zorder=2, solid_joinstyle='miter')
+    # The goal line runs the full width of the window: it is the ground, not part of the frame.
+    ax.plot([PENALTY_MAP_Y_MIN, PENALTY_MAP_Y_MAX], [PENALTY_GOAL_Z_MIN, PENALTY_GOAL_Z_MIN],
+            color='#888888', linewidth=1, zorder=2)
+
+def crop_penalty_map(ax):
+    '''Crop a penalty chart to its window and lock the aspect so the goal is in true proportion.
+
+    Both charts of the pair call this identically — unlike the pitch crops, there is no mirrored
+    variant, because the goal-mouth frame is already normalised to the shooter's own view (see
+    extract_penalties) and is the same frame on both sides.
+
+    THE X AXIS IS INVERTED, which is what puts the chart the same way round as SofaScore's own
+    words. Every penalty row carries a `goalMouthLocation` label — "low-left", "high-right" and so
+    on — describing the very coordinate being plotted, and drawn with y ascending to the right
+    every one of them came out mirrored: the seven Nashville penalties labelled left all sat right
+    of centre and vice versa. Inverting makes the label and the picture agree.
+
+    Which SIDE'S left that is, the data cannot settle, and the axis labels say so rather than
+    guessing: a goal-mouth graphic is conventionally drawn as the shooter sees it, and the placement
+    distribution leans the same way (30 of 51 archive penalties are labelled left, the natural side
+    for a right-footed taker striking with the inside of the foot), but neither is proof. What the
+    inversion does guarantee is that this chart never contradicts the field it is drawn from.'''
+    ax.set_xlim(PENALTY_MAP_Y_MAX, PENALTY_MAP_Y_MIN)
+    ax.set_ylim(PENALTY_MAP_Z_MIN, PENALTY_MAP_Z_MAX)
+    ax.set_aspect(GOAL_ASPECT)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+def label_penalty_sides(ax):
+    """State the viewpoint under a penalty chart.
+
+    Both charts of the pair are drawn as the TAKER sees the goal, so left on this page is the
+    shooter's left on both. Saying so is what stops a reader decoding a mark as the keeper's side;
+    see crop_penalty_map for how the orientation is pinned to SofaScore's own goalMouthLocation
+    labels."""
+    ax.set_xlabel("Shooter's view", labelpad=6, fontsize=8)
+
+def penalty_marker_area(xgot, uniform=False):
+    '''Marker area for one penalty, sized by xGOT rescaled onto the range penalties actually
+    occupy — see PENALTY_XGOT_FLOOR. Reuses the shot map's ramp so a mark of a given size means a
+    comparable thing across the report.
+
+    uniform=True is the no-xGOT fallback, matching plot_shot_marks' handling of a competition
+    that carries no xG: every mark is drawn at one middling size and the size key is dropped, so
+    nothing on the page claims a precision the data doesn't have.'''
+    if uniform:
+        return shot_marker_area(SHOT_UNIFORM_XG, None)
+    scaled = (np.asarray(xgot, dtype=float) - PENALTY_XGOT_FLOOR) / (1.0 - PENALTY_XGOT_FLOOR)
+    # NaN survives the arithmetic and would silently vanish from a scatter; a penalty with no
+    # recorded xGOT is still a penalty that was struck somewhere, so it draws at the floor.
+    return shot_marker_area(np.nan_to_num(scaled, nan=0.0), None)
+
+def plot_penalty_marks(ax, penalties, color, uniform_size=False):
+    '''Draw a set of penalties on the goal frame, all in one colour.
+
+    Split by outcome so each gets its shape (PENALTY_OUTCOME_MARKERS), then sized by xGOT. Called
+    once per taker by generate_penalty_map and once per keeper by generate_def_penalty_map — the
+    identical call on both sides is what keeps the two charts' vocabulary the same.
+
+    The parallel of plot_shot_marks, not a reuse of it: that function reads pitch coordinates and
+    keys its shapes on the situation, neither of which applies here.'''
+    for scored, marker in PENALTY_OUTCOME_MARKERS.items():
+        subset = penalties[(penalties['shotType'] == 'goal') == scored]
+        if subset.empty:
+            continue
+        ax.scatter(subset['goalMouthCoordinates.y'], subset['goalMouthCoordinates.z'],
+                   color=color, marker=marker,
+                   s=penalty_marker_area(subset['xgot'].to_numpy(), uniform_size),
+                   edgecolors='black', linewidths=SHOT_MARKER_EDGE_WIDTH,
+                   alpha=SHOT_MARKER_ALPHA,
+                   # Goals ride above the rest, as on the shot map.
+                   zorder=5 if scored else 4)
 
 def goal_marker(marker):
     '''(shape, area_scale) for a shot that went in, per SHOT_GOAL_STYLE. Plain shapes need no
@@ -603,7 +777,18 @@ def _companion_colorbar_right_edge(ax):
     before touching table_legend), so a narrow axes hugging this one's right edge over the same
     rows is exactly what `page.add_axes([pitch_pos.x1 + 0.02, pitch_pos.y0, 0.015,
     pitch_pos.height])` creates. Falls back to this axes' own right edge when nothing matches —
-    the xG-less shot map skips its colorbar entirely, and the gap genuinely starts at the pitch.'''
+    the xG-less shot map skips its colorbar entirely, and the gap genuinely starts at the pitch.
+
+    Draws first, for the reason legend_bottom_in_axes gives: the label's extent does not exist
+    until something has laid it out, and an unlaid-out label reports a position near the origin.
+    center_legend_in_gap happens to draw before calling this, but notes_box_x0 does not — and page
+    two carries no legends at all, so nothing else on that page would ever trigger the layout.
+    Without this the colourbar labels there measured as 0.012 and both notes boxes were placed
+    against the left edge of the page.'''
+    try:
+        ax.figure.canvas.draw()
+    except Exception:
+        pass
     ax_pos = ax.get_position()
     for other in ax.figure.axes:
         if other is ax:
@@ -619,10 +804,19 @@ def _companion_colorbar_right_edge(ax):
     return ax_pos.x1
 
 def center_legend_in_gap(ax, legend, anchor_x, top):
-    '''Re-anchor a just-built legend so its box is horizontally centred in the empty column
-    between the inside edge of this chart (its colorbar and label, if it has one — see
-    _companion_colorbar_right_edge — else the pitch itself) and RIGHT_CHART_X0, the sibling
-    chart's left edge, rather than sitting wherever the caller's anchor_x happened to land it.
+    '''Re-anchor a just-built legend so its box is centred on the middle of the PAGE, rather than
+    sitting wherever the caller's anchor_x happened to land it.
+
+    The page centre is the right answer because the pairs are laid out symmetrically — see
+    PAGE_CENTRE_X. It is also the only answer that puts every key column on one line down the
+    report: page three's charts are wider than page four's corners, so a key centred in each
+    pair's own gap would sit at a slightly different x on each page.
+
+    Clamped, not just centred. A key wider than the gap would reach back over the left chart's
+    colourbar label, so the box is pushed right if it would cross it. Nothing in the report
+    currently trips this — the widest key runs about 0.19 against a gap of 0.26 — and it exists so
+    that a squad with an unusually long name list degrades by sitting off-centre rather than by
+    printing over a label.
 
     A real draw is needed first to know the box's rendered width, the same requirement
     legend_bottom_in_axes has and for the same reason: nothing has a window extent until
@@ -631,12 +825,12 @@ def center_legend_in_gap(ax, legend, anchor_x, top):
     delta in axes fraction translates the box by that same delta in figure fraction regardless of
     where anchor_x started.'''
     ax.figure.canvas.draw()
-    gap_left = _companion_colorbar_right_edge(ax)
     box = legend.get_window_extent()
     (box_x0, _), (box_x1, _) = ax.figure.transFigure.inverted().transform([(box.x0, 0), (box.x1, 0)])
     ax_pos = ax.get_position()
-    gap_center = (gap_left + RIGHT_CHART_X0) / 2
-    shift_axes = (gap_center - (box_x0 + box_x1) / 2) / ax_pos.width
+    target_x0 = PAGE_CENTRE_X - (box_x1 - box_x0) / 2
+    gap_left = _companion_colorbar_right_edge(ax)
+    shift_axes = (max(target_x0, gap_left) - box_x0) / ax_pos.width
     legend.set_bbox_to_anchor((anchor_x + shift_axes, top), transform=ax.transAxes)
 
 def plot_corner_marks(ax, corners, color, alpha=CORNER_MARKER_ALPHA):
@@ -730,9 +924,12 @@ SHOT_OFF_TARGET_TYPES = {'miss', 'block', 'post'}
 # value should not silently remove events from the chart.
 SHOT_SITUATION_DEFAULT = 'Open Play'
 
-# How much wider each notes box is than the chart bbox it sits under, split evenly on
-# both sides of the shared center (see notes_x0 at each call site).
-NOTES_WIDTH_PAD = 0.04
+# How far in from the page edge PAGE TWO's notes boxes sit. Pages three and four run theirs out
+# to PAGE_MARGIN, which on page two put them 0.30 apart — further than that page wants, since its
+# charts are the widest in the report and its boxes then sat well outside the pitches above them.
+# 0.07 lands the pair 0.22 apart, halfway between that and the 0.136 they had when each box was
+# centred under its own chart.
+PAGE_TWO_NOTES_MARGIN = 0.07
 
 # Every notes box on the report is this size. Page two already rendered 0.32 x 0.12 while pages
 # three and four had drifted to 0.28, 0.26, 0.248 and 0.208 wide, because each chart derived its
@@ -900,6 +1097,31 @@ def abbreviate_player_name(name):
     return f"{parts[0][0]}. {' '.join(parts[surname_start:])}"
 
 #%%
+def notes_box_x0(ax, notes_width, margin=None):
+    '''Left edge for a notes box sitting under `ax`: pushed out to the page margin on whichever
+    side of the page its chart is on.
+
+    The pair is what this positions, not the individual box. Both boxes go as far apart as the
+    margins allow, which leaves the widest possible writing area, the most separation between two
+    blocks of handwriting, and — since the two margins are mirror images — a pair that is exactly
+    symmetric about the middle of the page.
+
+    Deliberately NOT centred under the chart, which is what these did before. Page two's pitches
+    are the widest in the report and sit closest to the middle, so boxes centred under them landed
+    0.136 apart against the 0.28-0.30 that pages three and four were getting — the same two boxes
+    reading as a different layout on every page. Aligning to the margin instead makes the gap the
+    same everywhere and does not depend on how wide the chart above happens to be.
+
+    A notes box is a writing area, not a label for the chart above it, so it does not have to line
+    up with that chart — and on the pages where the pitches are narrow it very nearly does anyway.
+
+    `margin` is how far in from the page edge the pair sits. Pages three and four use the page
+    margin itself; page two passes PAGE_TWO_NOTES_MARGIN, which holds its boxes further in — see
+    that constant.'''
+    margin = PAGE_MARGIN if margin is None else margin
+    on_left = (ax.get_position().x0 + _companion_colorbar_right_edge(ax)) / 2 < PAGE_CENTRE_X
+    return margin if on_left else 1 - margin - notes_width
+
 def draw_notes_box(page, bbox):
     '''Empty bordered rectangle reserving space for a real fillable PDF field, added in a
     post-processing pass over the finished report (matplotlib alone can't create
@@ -1139,7 +1361,7 @@ def extract_gk_passes(matches):
 # page-two render, then solved for the y0 that makes three gaps equal — separator line to
 # upper-row title, upper-row notes-box bottom to lower-row title, and lower-row notes-box
 # bottom to the page's inner border. Changing bbox height/width invalidates this value.
-def generate_relative_gk_pass_map(leagues, team, team_matches, date, team_colors, page, bbox=[0.13, 0.4683, 0.28, 0.42]):
+def generate_relative_gk_pass_map(leagues, team, team_matches, date, team_colors, page, bbox=[0.104, 0.4683, 0.28, 0.42]):
 
     # extract_gk_passes needs Player_Statistics.csv to identify which player names
     # are goalkeepers — without it every league match fails that guard and the
@@ -1272,10 +1494,9 @@ def generate_relative_gk_pass_map(leagues, team, team_matches, date, team_colors
     # rather than under the chart's own bbox[0], which varies slightly chart to chart.
     # Anchored on the same TOP edge as before (old_y0 + old_height=0.06) and grown
     # downward from there — growing from y0 upward instead ate into the plot above it.
-    notes_width = bbox[2] + NOTES_WIDTH_PAD
-    notes_x0 = 0.25 - notes_width / 2
+    notes_x0 = notes_box_x0(ax, NOTES_WIDTH, PAGE_TWO_NOTES_MARGIN)
     notes_y0 = bbox[1] + NOTES_OFFSET - 0.06
-    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, notes_width, 0.12])
+    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, NOTES_WIDTH, 0.12])
 
     return page, notes_bbox
 #%%
@@ -1300,7 +1521,7 @@ def extract_def_actions(matches):
     return def_actions
 
 #%%
-def generate_defensive_action_map(leagues, team, team_matches, date, team_colors, page, bbox=[0.59, 0.4683, 0.28, 0.42]):
+def generate_defensive_action_map(leagues, team, team_matches, date, team_colors, page, bbox=[0.595, 0.4683, 0.28, 0.42]):
 
     league_matches = load_league_data(leagues, date, ['Player_Event_Data.csv'], exclude_team=team)
 
@@ -1381,14 +1602,14 @@ def generate_defensive_action_map(leagues, team, team_matches, date, team_colors
 
     # Shares NOTES_OFFSET and bbox[1]=0.50 with generate_relative_gk_pass_map so the two
     # notes boxes land on the same horizontal line (see that function for why bbox[1]
-    # rather than the pitch's own resolved position is used as the anchor). Centered on
-    # the right half of the page (x=0.75), mirroring the left-side charts. Anchored on
-    # the same TOP edge as before (old_y0 + old_height=0.06) and grown downward from
-    # there — growing from y0 upward instead ate into the plot above it.
-    notes_width = bbox[2] + NOTES_WIDTH_PAD
-    notes_x0 = 0.75 - notes_width / 2
+    # rather than the pitch's own resolved position is used as the anchor). Centred on
+    # THIS chart rather than on the right half of the page: the pairs are now inset
+    # symmetrically (see PAGE_MARGIN) so the old hardcoded 0.75 no longer sits under the
+    # pitch it belongs to. Anchored on the same TOP edge as before (old_y0 + old_height=0.06)
+    # and grown downward from there — growing from y0 upward instead ate into the plot above it.
+    notes_x0 = notes_box_x0(ax, NOTES_WIDTH, PAGE_TWO_NOTES_MARGIN)
     notes_y0 = bbox[1] + NOTES_OFFSET - 0.06
-    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, notes_width, 0.12])
+    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, NOTES_WIDTH, 0.12])
 
     return page, notes_bbox
 
@@ -1576,7 +1797,7 @@ def buildup_grids(matches):
     }
 
 #%%
-def generate_buildup_turnover_map(leagues, team, team_matches, date, team_colors, page, bbox=[0.08, 0.0684, 0.29, 0.42]):
+def generate_buildup_turnover_map(leagues, team, team_matches, date, team_colors, page, bbox=[0.054, 0.0684, 0.29, 0.42]):
 
     team_grids = buildup_grids(team_matches)
     league_grids = buildup_grids(load_league_data(leagues, date, ['Player_Event_Data.csv'], exclude_team=team))
@@ -1677,10 +1898,9 @@ def generate_buildup_turnover_map(leagues, team, team_matches, date, team_colors
     # (x=0.25) rather than under the chart's own bbox[0]. Anchored on the same TOP edge
     # as before (old_y0 + old_height=0.06) and grown downward from there — growing from
     # y0 upward instead ate into the plot above it.
-    notes_width = bbox[2] + NOTES_WIDTH_PAD
-    notes_x0 = 0.25 - notes_width / 2
+    notes_x0 = notes_box_x0(ax, NOTES_WIDTH, PAGE_TWO_NOTES_MARGIN)
     notes_y0 = bbox[1] + 0.05 - 0.06
-    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, notes_width, 0.12])
+    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, NOTES_WIDTH, 0.12])
 
     return page, notes_bbox
 
@@ -1813,7 +2033,7 @@ def pressing_grids(pressing_matches, buildout_actions):
     }
 
 #%%
-def generate_pressing_turnover_map(leagues, team, team_matches, date, team_colors, page, bbox=[0.55, 0.0684, 0.29, 0.42]):
+def generate_pressing_turnover_map(leagues, team, team_matches, date, team_colors, page, bbox=[0.548, 0.0684, 0.29, 0.42]):
 
     # Team side denominator: the REAL opponents' own offensive activity (pass + dribble)
     # in this zone, not how much the scouted team merely defended there — normalizes
@@ -1914,10 +2134,9 @@ def generate_pressing_turnover_map(leagues, team, team_matches, date, team_color
     # (x=0.75), mirroring the left-side charts. Anchored on the same TOP edge as before
     # (old_y0 + old_height=0.06) and grown downward from there — growing from y0 upward
     # instead ate into the plot above it.
-    notes_width = bbox[2] + NOTES_WIDTH_PAD
-    notes_x0 = 0.75 - notes_width / 2
+    notes_x0 = notes_box_x0(ax, NOTES_WIDTH, PAGE_TWO_NOTES_MARGIN)
     notes_y0 = bbox[1] + 0.05 - 0.06
-    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, notes_width, 0.12])
+    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, NOTES_WIDTH, 0.12])
 
     return page, notes_bbox
 
@@ -2341,13 +2560,9 @@ def generate_key_pass_map(leagues, team, team_matches, date, team_colors, page,
     # Anchored on the same TOP edge as before (old_y0 + old_height=0.06) and grown
     # downward from there — growing from y0 upward instead ate into the plot above it.
     #
-    # Aligned to the chart itself rather than centred on the page's left half (x=0.25)
-    # like the page-two charts: once this chart moved out to bbox[0]=0.03 the page-half
-    # centre left the box visibly offset to the right of the pitch above it. Matching the
-    # chart's own x-extent also avoids the NOTES_WIDTH_PAD overhang, which at this x
-    # would have pushed the box's left edge to 0.01 — outside the page's inner border
-    # at 0.018.
-    notes_x0 = bbox[0]
+    # x comes from notes_box_x0, which pushes the box out to the page margin — see there for why
+    # every notes box in the report is placed that way rather than under its own chart.
+    notes_x0 = notes_box_x0(ax, NOTES_WIDTH)
     notes_y0 = bbox[1] + 0.05 - 0.06
     notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, NOTES_WIDTH, 0.12])
 
@@ -2359,7 +2574,7 @@ def generate_key_pass_map(leagues, team, team_matches, date, team_colors, page,
 # colourbar and rotated label occupy ~0.345, so 0.60 still finishes inside the page's
 # inner border at 0.982.
 def generate_def_key_pass_map(leagues, team, team_matches, date, team_colors, page,
-                              bbox=[0.60, 0.50, 0.26, 0.42], shared_vmax=None):
+                              bbox=[0.632, 0.50, 0.26, 0.42], shared_vmax=None):
     '''Where the scouted team CONCEDES key passes — the defensive mirror of
     generate_key_pass_map.'''
 
@@ -2453,12 +2668,12 @@ def generate_def_key_pass_map(leagues, team, team_matches, date, team_colors, pa
     # the visible cue that this is the defensive mirror of the chart beside it.
     ax.set_xlabel('←    Opposition Attack    ←', labelpad=8, fontsize=8)
 
-    # Centered on the right half of the page (x=0.75), mirroring the left-side sibling —
-    # the same convention the page-two charts use for their notes boxes.
-    notes_width = bbox[2] + NOTES_WIDTH_PAD
-    notes_x0 = 0.75 - notes_width / 2
+    # NOTES_WIDTH, not this chart's own bbox plus a pad — the sibling opposite uses the flat
+    # constant, and deriving it here made this box 0.30 wide against that one's 0.32. Two boxes
+    # on one row reading as different sizes is what the shared constant exists to prevent.
+    notes_x0 = notes_box_x0(ax, NOTES_WIDTH)
     notes_y0 = bbox[1] + 0.05 - 0.06
-    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, notes_width, 0.12])
+    notes_bbox = draw_notes_box(page, [notes_x0, notes_y0, NOTES_WIDTH, 0.12])
 
     return page, notes_bbox
 
@@ -2615,6 +2830,53 @@ def extract_shots(matches, team, conceded=False, quiet=False):
     shots['Situation Group'] = shots['situation'].map(SHOT_SITUATION_GROUPS).fillna(SHOT_SITUATION_DEFAULT)
 
     return shots
+
+#%%
+# The goal-plane coordinates the penalty charts plot against, plus the columns their keys read.
+# Only needed for the empty-data path: extract_shots passes every Shot_Map.csv column through
+# untouched, so on real data these are already present.
+PENALTY_COLUMNS = SHOT_COLUMNS + ['goalMouthCoordinates.y', 'goalMouthCoordinates.z']
+
+def extract_penalties(matches, team, conceded=False, quiet=False):
+    '''The penalties `team` took across `matches`, or faced when conceded=True.
+
+    A filter over extract_shots rather than a reader of its own — penalties are ordinary rows in
+    Shot_Map.csv, already loaded, and everything that function does to them (the own-goal filter,
+    the xG rules, the situation mapping) applies unchanged. Deliberately the same source the shot
+    map reads, so the penalties EXCLUDED there by SHOT_EXCLUDED_SITUATIONS are exactly the ones
+    that appear here: between them the two charts account for every shot once.
+
+    The coordinates these charts use are NOT the ones extract_shots derives. goalMouthCoordinates
+    .y/.z is a second frame in the same file describing where the ball crossed the goal plane, and
+    it needs no home/away correction: checked across the archive, the mean y of a delivery labelled
+    "low-right" is 46.63 for away shooters and 46.62 for home ones, i.e. it is already expressed
+    from the shooter's own point of view whichever end they are attacking. That is why this
+    function has no equivalent of the pitch charts' rotate_into_opponent_frame.'''
+    shots = extract_shots(matches, team, conceded=conceded, quiet=quiet)
+    if shots.empty:
+        return pd.DataFrame(columns=PENALTY_COLUMNS)
+
+    penalties = shots[shots['Situation Group'] == 'Penalty'].copy()
+    if penalties.empty:
+        return pd.DataFrame(columns=PENALTY_COLUMNS)
+
+    # A penalty with no recorded placement cannot be drawn. Measured across the archive there are
+    # none — all 1,292 carry both coordinates, including every miss — so this guards a format
+    # change rather than a known gap, and drops rather than plotting at a default position.
+    placed = (np.isfinite(penalties['goalMouthCoordinates.y'])
+              & np.isfinite(penalties['goalMouthCoordinates.z']))
+    if not placed.all() and not quiet:
+        described = 'conceded' if conceded else 'taken'
+        print(f'{(~placed).sum()} of {len(penalties)} penalties {described} carry no goal-mouth '
+              f'coordinates — excluded from the penalty map.')
+
+    # RESET, because extract_shots concatenates one frame per match WITHOUT reindexing and so
+    # hands back an index that repeats across matches. The shot charts never notice — they select
+    # with boolean masks — but penalties_by_keeper builds a dict keyed on this index, and two
+    # penalties conceded in different matches that happened to be the same row number in their
+    # respective Shot_Map.csv files silently overwrote each other. Measured on New York City FC:
+    # four conceded penalties collapsed to two, and the keeper key under-reported by half.
+    return penalties[placed].reset_index(drop=True)
 
 #%%
 def matches_with_xg(matches):
@@ -3130,16 +3392,14 @@ def generate_shot_map(leagues, team, matches, date, team_colors, page,
                    'Marker Size = Shot xG' if xg_available else 'Marker Outline',
                    SHOT_LEGEND_ANCHOR_X, scale_top, labelspacing=0.8, handlelength=1.0)
 
-    # Aligned to the chart's own x-extent rather than centred on a page half — at bbox[0]=0.03
-    # the page-half centre would put the box well to the right of the pitch it belongs to, and
-    # the NOTES_WIDTH_PAD overhang would push its left edge outside the page's inner border.
+    # x comes from notes_box_x0, which pushes the box out to the page margin — see there.
     #
     # Unlike the siblings, the y is NOT derived from bbox[1]: this chart's bbox is sized to the
     # cropped pitch exactly (see the note above the signature), so there is no aspect-lock slack
     # between bbox[1] and where the pitch really ends, and the siblings' bbox[1]+0.05-0.06
     # offset would put the box straight through the x-label. Fixed instead, leaving 0.03 of
     # clearance below the pitch for that label.
-    notes_bbox = draw_notes_box(page, [bbox[0], SHOT_NOTES_Y0, NOTES_WIDTH,
+    notes_bbox = draw_notes_box(page, [notes_box_x0(ax, NOTES_WIDTH), SHOT_NOTES_Y0, NOTES_WIDTH,
                                        bbox[1] - 0.03 - SHOT_NOTES_Y0])
 
     return page, notes_bbox, shared_vmax
@@ -3159,7 +3419,7 @@ def generate_shot_map(leagues, team, matches, date, team_colors, page,
 # because the unabbreviated key-pass list ran to 0.613 and collided with the conceded chart above
 # — the same 0.600 edge, one row up. A squad with a longer compound surname is what would break
 # this, and the fix is that function, not this bbox.
-def generate_def_shot_map(team, matches, team_colors, page, bbox=[0.60, 0.20, 0.26, 0.26],
+def generate_def_shot_map(team, matches, team_colors, page, bbox=[0.632, 0.20, 0.26, 0.26],
                           shared_vmax=None):
     '''Where the scouted team CONCEDES shots — the defensive mirror of generate_shot_map.
 
@@ -3264,14 +3524,12 @@ def generate_def_shot_map(team, matches, team_colors, page, bbox=[0.60, 0.20, 0.
     # visible cue that this is a defensive mirror, matching the chart directly above it.
     ax.set_xlabel('←    Opposition Attack    ←', labelpad=8, fontsize=8)
 
-    # Centred on the right half of the page like generate_def_key_pass_map, which at this width
-    # puts the left edge at 0.60 — flush with the chart's own, since the NOTES_WIDTH_PAD overhang
-    # happens to cancel the offset here.
+    # x comes from notes_box_x0, which pushes the box out to the page margin — see there.
     #
     # The y is taken from generate_shot_map's derivation rather than the siblings' bbox[1]+0.05
     # -0.06: this chart's bbox is sized to the cropped pitch exactly, so there is no aspect-lock
     # slack to absorb that offset and it would put the box straight through the x-label.
-    notes_x0 = 0.75 - NOTES_WIDTH / 2
+    notes_x0 = notes_box_x0(ax, NOTES_WIDTH)
     notes_bbox = draw_notes_box(page, [notes_x0, SHOT_NOTES_Y0, NOTES_WIDTH,
                                        bbox[1] - 0.03 - SHOT_NOTES_Y0])
 
@@ -3584,7 +3842,7 @@ def generate_corner_map(leagues, team, matches, date, team_colors, page,
     # Aligned to the chart's own x-extent rather than centred on a page half, and the y is fixed
     # rather than derived from bbox[1] — both for the reasons generate_shot_map gives: the bbox
     # is sized to the cropped pitch exactly, so there is no aspect-lock slack to absorb an offset.
-    notes_bbox = draw_notes_box(page, [bbox[0], CORNER_NOTES_Y0, NOTES_WIDTH,
+    notes_bbox = draw_notes_box(page, [notes_box_x0(ax, NOTES_WIDTH), CORNER_NOTES_Y0, NOTES_WIDTH,
                                        bbox[1] - 0.03 - CORNER_NOTES_Y0])
 
     return page, notes_bbox, (ax, key_bottom_figure), shared_vmax
@@ -3656,7 +3914,7 @@ def corner_defender_rows(counts, conceded_corners, matches,
 # below them, which is why it takes key_column_bottom rather than placing itself: there is no room
 # for a text list to the right of a chart whose colourbar label already reaches x~0.95.
 def generate_def_corner_map(leagues, team, matches, date, team_colors, page,
-                            bbox=[0.60, 0.525, 0.208, 0.26], key_column=None,
+                            bbox=[0.672, 0.525, 0.208, 0.26], key_column=None,
                             expected_lineup=None, expected_subs=None, shared_vmax=None):
     '''Where this team CONCEDES corners, and who deals with them — the defensive mirror of
     generate_corner_map.
@@ -3751,9 +4009,369 @@ def generate_def_corner_map(leagues, team, matches, date, team_colors, page,
         table_legend(anchor_ax, defender_header, defender_rows, 'Corners Defended',
                      CORNER_LEGEND_ANCHOR_X, top, grey=defender_grey)
 
-    notes_x0 = 0.75 - NOTES_WIDTH / 2
+    notes_x0 = notes_box_x0(ax, NOTES_WIDTH)
     notes_bbox = draw_notes_box(page, [notes_x0, CORNER_NOTES_Y0, NOTES_WIDTH,
                                        bbox[1] - 0.03 - CORNER_NOTES_Y0])
+
+    return page, notes_bbox
+
+#%%
+def penalty_taker_rows(penalties, matches, expected_lineup=None, expected_subs=None,
+                       xg_available=True):
+    '''(header, rows, handles, grey, colors) for the "Penalty Takers" key.
+
+    Returns the colour map alongside the rows because the chart draws each taker's marks in the
+    same colour their row carries — building it here keeps the two from drifting apart.
+
+    Ranked by penalties taken. Not by conversion rate, which at these volumes is a near-useless
+    ordering: a squad's takers typically sit at one or two penalties each, so a rate column ranks
+    a 1-for-1 cameo above a 5-for-6 designated taker. Volume answers the question a reader
+    actually brings to this chart — who steps up — and the conversion column is there to be read
+    once they have.
+
+    ±xGOT is the taker's placement quality against the 0.7884 the model gives every penalty:
+    positive means they hit corners a keeper cannot reach. It is the one number here that
+    separates a well-struck penalty from a lucky one, which is why the key carries it even though
+    at three or four attempts it is plainly noisy.'''
+    if penalties.empty:
+        return None, [], [], [], {}
+
+    order = penalties['player.name'].value_counts()
+    takers = list(order.index[:CORNER_TAKER_LEGEND_MAX])
+    qualified = player_qualifier(matches, expected_lineup, expected_subs)
+    distinct_colors = distinct_player_colors()
+
+    colors, handles, values, grey = {}, [], [], []
+    for i, taker in enumerate(takers):
+        colors[taker] = distinct_colors[i % len(distinct_colors)]
+        taken = penalties[penalties['player.name'] == taker]
+        scored = int((taken['shotType'] == 'goal').sum())
+        if xg_available:
+            # Summed, not averaged: at one or two penalties a mean is the same number with a
+            # false air of precision, and a total says plainly how much the placement was worth.
+            delta = (taken['xgot'] - taken['xg']).sum()
+            values.append((abbreviate_player_name(taker), len(taken),
+                           f'{scored}/{len(taken)}', f'{delta:+.2f}'))
+        else:
+            values.append((abbreviate_player_name(taker), len(taken), f'{scored}/{len(taken)}'))
+        handles.append(Patch(facecolor=colors[taker], edgecolor='black', linewidth=0.5))
+        grey.append(not qualified(taker))
+
+    columns = ([('Taker', 17, '<'), ('Pens', 5, '>'), ('Scored', 7, '>'), ('±xGOT', 6, '>')]
+               if xg_available else
+               [('Taker', 17, '<'), ('Pens', 5, '>'), ('Scored', 7, '>')])
+    header, rows = format_key_table(columns, values)
+    return header, rows, handles, grey, colors
+
+#%%
+def penalties_by_keeper(penalties, matches, team):
+    '''Which of this team's goalkeepers faced each conceded penalty — {keeper name: row index}.
+
+    Read from Player_Statistics.csv's `penaltyFaced`, NOT from the shot row's own goalkeeper.name:
+    that field is blank on ~60% of shots (200 of 514 penalties archive-wide carry it), which would
+    leave most marks uncoloured. `penaltyFaced` is populated whenever a penalty was faced —
+    checked against Shot_Map.csv across all 88 MLS matches in the archive that conceded one, with
+    zero disagreements on the count.
+
+    It also settles WHICH keeper, which the obvious alternative — assume whoever started — cannot.
+    A keeper coming off the bench and facing a penalty is rare but real, and the statistic records
+    it against the man who actually faced it. In the archive no single match ever has two keepers
+    with penaltyFaced > 0, so the "several keepers in one match" case is handled by attributing in
+    squad order rather than with anything cleverer: it does not occur, and inventing an ordering
+    rule for it would be untestable.
+
+    Falls back to the starting keeper for a match whose statistics lack the column entirely, which
+    keeps a mark on the chart rather than dropping a real penalty for a missing field.'''
+    assignments = {}
+    for match, match_penalties in penalties.groupby('Match'):
+        match_files = matches.get(match, {})
+        stats = match_files.get('Player_Statistics.csv')
+        if stats is None or 'Position' not in stats.columns:
+            continue
+        keepers = stats[stats['Position'] == 'G']
+        if keepers.empty:
+            continue
+
+        faced = None
+        if 'penaltyFaced' in keepers.columns:
+            involved = keepers[keepers['penaltyFaced'].fillna(0) > 0]
+            if not involved.empty:
+                faced = list(involved['Player Name'])
+        if faced is None:
+            starters = keepers[~keepers['Substitute'].fillna(False).astype(bool)]
+            faced = list(starters['Player Name'])[:1] or list(keepers['Player Name'])[:1]
+        if not faced:
+            continue
+
+        # One keeper is the only case the data ever presents (see docstring); the zip is what
+        # keeps the several-keeper case from raising rather than a claim to resolve it correctly.
+        for index, keeper in zip(match_penalties.index, faced * len(match_penalties)):
+            assignments[index] = keeper
+    return assignments
+
+def penalty_keeper_rows(penalties, assignments, matches,
+                        expected_lineup=None, expected_subs=None, xg_available=True):
+    '''(header, rows, handles, grey, colors) for the "Penalties Faced" key.
+
+    The defensive counterpart of penalty_taker_rows, and deliberately the same shape: colour
+    identifies a person, the row states how often and how well.
+
+    The performance column is xGOT faced MINUS goals conceded — the keeper's own version of the
+    taker's ±xGOT, and not the same subtraction. A taker is measured against what the model
+    expected of the placement (xgot - xg); a keeper is measured against what the placement
+    deserved to yield (xgot - goals), so positive means they saved what should have gone in. Both
+    columns are headed ±xGOT because both answer "against expectation", and the two charts are
+    never read as one table.'''
+    if penalties.empty or not assignments:
+        return None, [], [], [], {}
+
+    keeper_column = penalties.index.map(assignments)
+    named = penalties[keeper_column.notna()].copy()
+    if named.empty:
+        return None, [], [], [], {}
+    named['Keeper'] = keeper_column[keeper_column.notna()]
+
+    order = named['Keeper'].value_counts()
+    qualified = player_qualifier(matches, expected_lineup, expected_subs)
+    distinct_colors = distinct_player_colors()
+
+    colors, handles, values, grey = {}, [], [], []
+    for i, keeper in enumerate(order.index[:CORNER_TAKER_LEGEND_MAX]):
+        colors[keeper] = distinct_colors[i % len(distinct_colors)]
+        faced = named[named['Keeper'] == keeper]
+        # Only a genuine save counts, not every penalty that stayed out: a taker who puts it over
+        # the bar has not been saved by anybody, and crediting the keeper for it would flatter
+        # whoever happened to be in goal. Such a penalty still counts under Faced, and lands
+        # neutrally in the ±xGOT column, where its xGOT of 0 offsets the goal it did not become.
+        saved = int((faced['shotType'] == 'save').sum())
+        if xg_available:
+            prevented = faced['xgot'].sum() - int((faced['shotType'] == 'goal').sum())
+            values.append((abbreviate_player_name(keeper), len(faced),
+                           f'{saved}/{len(faced)}', f'{prevented:+.2f}'))
+        else:
+            values.append((abbreviate_player_name(keeper), len(faced), f'{saved}/{len(faced)}'))
+        handles.append(Patch(facecolor=colors[keeper], edgecolor='black', linewidth=0.5))
+        grey.append(not qualified(keeper))
+
+    columns = ([('Keeper', 17, '<'), ('Faced', 6, '>'), ('Saved', 6, '>'), ('±xGOT', 6, '>')]
+               if xg_available else
+               [('Keeper', 17, '<'), ('Faced', 6, '>'), ('Saved', 6, '>')])
+    header, rows = format_key_table(columns, values)
+    return header, rows, handles, grey, colors
+
+#%%
+def penalty_outcome_handles():
+    '''Proxy marks for the outcome key, drawn colourless. Colour means a person on these charts,
+    so a coloured handle here would tie an outcome to whoever happened to be first in the list.'''
+    return [Line2D([], [], linestyle='none', marker=marker, markerfacecolor='#999999',
+                   markeredgecolor='black', markeredgewidth=SHOT_MARKER_EDGE_WIDTH,
+                   markersize=np.sqrt(SHOT_LEGEND_MARKER_AREA))
+            for marker in PENALTY_OUTCOME_MARKERS.values()]
+
+def report_clipped_penalties(penalties, described):
+    '''Warn when a penalty lands outside the drawn window — see PENALTY_MAP_Y_MIN. The keys count
+    every penalty, so without this a reader could count four marks against a row saying five.'''
+    outside = ((penalties['goalMouthCoordinates.y'] < PENALTY_MAP_Y_MIN)
+               | (penalties['goalMouthCoordinates.y'] > PENALTY_MAP_Y_MAX)
+               | (penalties['goalMouthCoordinates.z'] < PENALTY_MAP_Z_MIN)
+               | (penalties['goalMouthCoordinates.z'] > PENALTY_MAP_Z_MAX))
+    if outside.any():
+        print(f'{outside.sum()} of {len(penalties)} penalties {described} were struck outside the '
+              f'drawn window (wild misses) — counted in the keys but not visible on the chart.')
+
+# Bottom row of page four. MUCH shorter than the corner pair above it, because a goal is a wide,
+# low rectangle: the window renders about 4.5:1 once GOAL_ASPECT is applied, so at this width the
+# frame occupies roughly 0.045 of page height whatever the box says. The box is sized to that
+# rather than to the corner row's 0.26 — the aspect lock centres the frame in whatever it is
+# given, so a taller box would not draw a bigger goal, it would only push the key column that
+# hangs beneath the chart down into the notes boxes.
+#
+# y=0.26 is set by what sits ABOVE it, and was measured rather than guessed: the corner row's
+# notes boxes end at 0.375, and this chart's title rises about 0.092 above bbox[1] once the
+# aspect-lock slack and the title pad are counted. That leaves 0.023 of clearance.
+#
+# Nothing binds it from below any more. The key column is centred on the page (PAGE_CENTRE_X) and
+# runs about 0.405-0.595, while this row's notes boxes sit at 0.03-0.37 and 0.64-0.96 — so the
+# four stacked keys can run past the top of those boxes without touching them. That is what makes
+# room for a six-taker squad, the worst case in the archive.
+def generate_penalty_map(leagues, team, matches, date, team_colors, page,
+                         bbox=[0.03, 0.26, 0.34, 0.07],
+                         expected_lineup=None, expected_subs=None):
+    '''Where this team puts its penalties, who takes them, and which ones went in.
+
+    Three encodings on a goal mouth: mark COLOUR for the taker, mark SHAPE for whether it was
+    scored, and mark SIZE for xGOT — how well struck the placement was, independent of whether the
+    keeper reached it. The heatmap every other chart in this report carries is deliberately absent:
+    a season yields a squad three to fifteen penalties, and binning that many events over a goal
+    would colour cells from single shots.
+
+    xG is NOT the size encoding here, though it is on the shot map. Every penalty in the archive
+    carries one of two xG values (0.7884 or 0.76, standard deviation 0.009) because the model
+    treats a penalty as a fixed-probability event, so sizing by it would draw every mark the same.
+    xGOT is measured after the fact and spans 0.58 to 0.99 on target, which is a real signal about
+    placement. See PENALTY_XGOT_FLOOR for how that narrow range is stretched to be visible.
+
+    This chart owns the WHOLE key column for the pair — takers, then the conceded chart's keepers,
+    then the two shared decoders. That is why it reads the conceded penalties it does not plot:
+    the keeper table has to be built here to sit second in the stack, above keys the sibling has
+    no way to draw underneath. The sibling is handed back the keeper colours so its marks match
+    the table describing them.
+
+    Returns (page, notes_bbox, xg_available, keeper_colors) — xg_available so the conceded sibling
+    matches this chart's xG fallback rather than judging it from its own handful of penalties.'''
+
+    penalties = extract_penalties(matches, team)
+    if penalties.empty:
+        print('No penalty data available — skipping penalty map.')
+        return page, None, None, {}
+
+    xg_available = has_xg(penalties)
+    report_clipped_penalties(penalties, 'taken')
+
+    ax = page.add_axes(bbox)
+    draw_goal_frame(ax)
+    crop_penalty_map(ax)
+
+    header, rows, handles, grey, colors = penalty_taker_rows(
+        penalties, matches, expected_lineup, expected_subs, xg_available)
+
+    # Per taker, so each gets their colour — the same loop the shot map runs per shooter.
+    for taker, color in colors.items():
+        plot_penalty_marks(ax, penalties[penalties['player.name'] == taker], color,
+                           uniform_size=not xg_available)
+    # Anyone past the cap still gets plotted, in the shared grey the other player keys use for
+    # their "Other" row. Dropping them would take real penalties off the chart.
+    listed = set(colors)
+    remainder = penalties[~penalties['player.name'].isin(listed)]
+    if not remainder.empty:
+        plot_penalty_marks(ax, remainder, '#999999', uniform_size=not xg_available)
+
+    title_fontsize, title_pad = 10, 12
+    ax.set_title('Penalties Taken' if xg_available
+                 else f'Penalties Taken ({SHOT_XG_FALLBACK_NOTE})',
+                 fontsize=title_fontsize, pad=title_pad)
+    label_penalty_sides(ax)
+
+    axes_height_points = ax.get_position().height * page.get_figheight() * 72
+    legend_top = 1.0 + (title_pad + 0.8 * title_fontsize) / axes_height_points
+
+    taker_legend = table_legend(ax, header, rows, 'Penalty Takers',
+                                CORNER_LEGEND_ANCHOR_X, legend_top,
+                                handles=handles, grey=grey, handlelength=1.0)
+    column_bottom = legend_bottom_in_axes(page, ax, taker_legend, -0.45)
+
+    # The conceded chart's key, built and drawn from here so it sits directly under the takers'
+    # — the two tables that name people belong together, above the shapes-and-sizes keys that
+    # decode both charts. extract_penalties re-reads frames already in memory, so reaching for the
+    # other direction costs nothing; generate_shot_map does the same for its situation key.
+    keeper_colors = {}
+    conceded = extract_penalties(matches, team, conceded=True, quiet=True)
+    if not conceded.empty:
+        keeper_header, keeper_rows, keeper_handles, keeper_grey, keeper_colors = (
+            penalty_keeper_rows(conceded, penalties_by_keeper(conceded, matches, team), matches,
+                                expected_lineup, expected_subs, xg_available))
+        if keeper_rows:
+            keeper_legend = table_legend(ax, keeper_header, keeper_rows, 'Penalties Faced',
+                                         CORNER_LEGEND_ANCHOR_X, column_bottom - SHOT_LEGEND_GAP,
+                                         handles=keeper_handles, grey=keeper_grey,
+                                         handlelength=1.0)
+            column_bottom = legend_bottom_in_axes(page, ax, keeper_legend, -0.75)
+
+    # Outcome and size keys decode BOTH charts, exactly as the shot map's situation and size keys
+    # decode its conceded sibling — the pair shares one vocabulary, and printing it twice on one
+    # page would say it changes between them. Counts stay taken-only: this key sits under the
+    # taken chart, and the conceded totals are already in the keeper table above it.
+    outcome_header, outcome_rows = format_key_table(
+        [('Outcome', 17, '<'), ('Taken', 6, '>')],
+        [(PENALTY_OUTCOME_LABELS[scored],
+          int(((penalties['shotType'] == 'goal') == scored).sum()))
+         for scored in PENALTY_OUTCOME_MARKERS])
+    outcome_top = column_bottom - SHOT_LEGEND_GAP
+    outcome_legend = table_legend(ax, outcome_header, outcome_rows, 'Penalty Outcomes',
+                                  CORNER_LEGEND_ANCHOR_X, outcome_top,
+                                  handles=penalty_outcome_handles(), handlelength=1.0,
+                                  labelspacing=KEY_TABLE_MARKER_SPACING)
+    key_bottom = legend_bottom_in_axes(page, ax, outcome_legend, -0.75)
+
+    if xg_available:
+        # Sized from the range penalties really occupy rather than SHOT_SIZE_LEGEND_VALUES' 0-1
+        # spread, which would show three marks the chart never draws.
+        scale_handles = [
+            Line2D([], [], linestyle='none', marker='o', markerfacecolor='#999999',
+                   markeredgecolor='black', markeredgewidth=SHOT_MARKER_EDGE_WIDTH,
+                   markersize=np.sqrt(penalty_marker_area(value)))
+            for value in (0.60, 0.80, 0.95)]
+        scale_top = key_bottom - SHOT_LEGEND_GAP
+        stacked_legend(ax, scale_handles, 'Marker Size = xGOT',
+                       CORNER_LEGEND_ANCHOR_X, scale_top,
+                       labels=[f'{value:.2f} xGOT' for value in (0.60, 0.80, 0.95)],
+                       labelspacing=0.8, handlelength=1.0)
+
+    notes_bbox = draw_notes_box(page, [notes_box_x0(ax, NOTES_WIDTH), PENALTY_NOTES_Y0, NOTES_WIDTH,
+                                       PENALTY_NOTES_HEIGHT])
+
+    return page, notes_bbox, xg_available, keeper_colors
+
+#%%
+def generate_def_penalty_map(leagues, team, matches, date, team_colors, page,
+                             bbox=[0.63, 0.26, 0.34, 0.07], keeper_colors=None,
+                             expected_lineup=None, expected_subs=None, xg_available=None):
+    '''Where this team's goalkeepers get beaten from the spot — the defensive mirror of
+    generate_penalty_map.
+
+    Colour identifies the KEEPER rather than the taker, which breaks the flat-team_colour
+    convention the other defensive mirrors follow, and for a reason those charts do not have: the
+    people worth telling apart here play for the scouted team. The opposing takers are a dozen
+    different clubs' penalty specialists and would make an unreadable key; their keepers are one or
+    two men whose records a reader has a real reason to compare.
+
+    The frame is NOT mirrored. It is drawn from the shooter's point of view, the same as the chart
+    beside it — see extract_penalties for why the coordinates already are. Flipping this one to a
+    keeper's-eye view would put the pair in opposite conventions, so a mark in the same place on
+    the two charts would mean opposite corners.
+
+    Carries no key of its own: the keeper table describing these marks is drawn by the sibling, in
+    the column both charts share, so that the two tables naming people sit together. This chart is
+    handed the colours that table used.
+
+    Returns (page, notes_bbox).'''
+
+    penalties = extract_penalties(matches, team, conceded=True, quiet=True)
+    if penalties.empty:
+        print('No conceded penalty data available — skipping conceded penalty map.')
+        return page, None
+
+    if xg_available is None:
+        xg_available = has_xg(penalties)
+    report_clipped_penalties(penalties, 'conceded')
+
+    ax = page.add_axes(bbox)
+    draw_goal_frame(ax)
+    crop_penalty_map(ax)
+
+    # Colours come from the sibling, which builds the keeper table (see generate_penalty_map) so
+    # that table can sit second in the shared column. The assignment itself is recomputed rather
+    # than passed: it is a pure function of frames both charts already hold, and recomputing it
+    # keeps this chart drawable on its own.
+    colors = keeper_colors or {}
+    keeper_of = penalties.index.map(penalties_by_keeper(penalties, matches, team))
+
+    for keeper, color in colors.items():
+        plot_penalty_marks(ax, penalties[keeper_of == keeper], color,
+                           uniform_size=not xg_available)
+    # Penalties whose keeper could not be established still belong on the chart — where a team is
+    # beaten from the spot does not depend on knowing who was in goal.
+    unattributed = penalties[~pd.Series(keeper_of, index=penalties.index).isin(list(colors))]
+    if not unattributed.empty:
+        plot_penalty_marks(ax, unattributed, '#999999', uniform_size=not xg_available)
+
+    ax.set_title('Penalties Conceded' if xg_available
+                 else f'Penalties Conceded ({SHOT_XG_FALLBACK_NOTE})', fontsize=10, pad=12)
+    label_penalty_sides(ax)
+
+    notes_x0 = notes_box_x0(ax, NOTES_WIDTH)
+    notes_bbox = draw_notes_box(page, [notes_x0, PENALTY_NOTES_Y0, NOTES_WIDTH,
+                                       PENALTY_NOTES_HEIGHT])
 
     return page, notes_bbox
 

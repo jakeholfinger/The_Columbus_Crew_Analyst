@@ -1431,8 +1431,8 @@ def generateThirdPage(leagues, team, opposition, targetMatch, date, expectedLine
 #%%
 def generateFourthPage(leagues, team, opposition, targetMatch, date,
                        expectedLineup=None, expectedSubs=None):
-    '''Set pieces. First pair: corners taken and corners conceded. The bottom half of the page is
-    deliberately left empty for the next set-piece pair.'''
+    '''Set pieces. Two pairs, each offence on the left and defence on the right: corners taken and
+    conceded across the top, penalties taken and conceded beneath them.'''
 
     page, teamColors = generatePageTemplate(team, opposition, targetMatch)
 
@@ -1457,16 +1457,32 @@ def generateFourthPage(leagues, team, opposition, targetMatch, date,
         key_column=cornerKeyColumn, shared_vmax=cornerVmax,
         expected_lineup=expectedLineup, expected_subs=expectedSubs)
 
+    # Second pair, same arrangement: the taken chart is drawn first and owns the whole shared key
+    # column, including the keeper table describing the conceded chart's marks. It hands back the
+    # colours that table used, so the conceded chart's marks match it, and whether this competition
+    # carries xGOT — judged over both directions rather than from the conceded side's few penalties.
+    page, penaltyNotesBbox, penaltyXgAvailable, penaltyKeeperColors = (
+        Tactical_Visualizations.generate_penalty_map(
+            leagues, opposition, oppositionMatches, date, teamColors, page,
+            expected_lineup=expectedLineup, expected_subs=expectedSubs))
+
+    page, defPenaltyNotesBbox = Tactical_Visualizations.generate_def_penalty_map(
+        leagues, opposition, oppositionMatches, date, teamColors, page,
+        keeper_colors=penaltyKeeperColors, xg_available=penaltyXgAvailable,
+        expected_lineup=expectedLineup, expected_subs=expectedSubs)
+
     notesFields = [
         ('corner_notes', cornerNotesBbox),
-        ('def_corner_notes', defCornerNotesBbox)
+        ('def_corner_notes', defCornerNotesBbox),
+        ('penalty_notes', penaltyNotesBbox),
+        ('def_penalty_notes', defPenaltyNotesBbox)
     ]
     notesFields = [(name, bbox) for name, bbox in notesFields if bbox is not None]
 
     return page, notesFields
 
 #%%
-def main(leagues=['Liga_MX,_Apertura', 'MLS', 'Leagues_Cup'], team='Columbus_Crew', opposition='Club_América', date='8-26-2026', formationOverride=False):
+def main(leagues=['MLS', 'Liga_MX,_Apertura', 'Leagues_Cup'], team='Club_América', opposition='Columbus_Crew', date='8-26-2026', formationOverride=False):
 #def main(leagues=['NCAA'], team='DePaul_Blue_Demons', opposition='Ohio_State_Buckeyes', date='8-24-2026', formationOverride=False):
     # Note: first value of leagues must be the opposition's primary league
     # formationOverride: pass a boolean that determines whether the deduced formation should be used or the user should input it
