@@ -7,12 +7,15 @@ import matplotlib.lines as mlines
 import matplotlib.image as mpimg
 from matplotlib.patches import Rectangle
 import os
+import shutil
 from curl_cffi import requests
+import Request_Utils
 import contextlib
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import time
 import re
+import unicodedata
 import urllib.request
 import urllib.parse
 import json
@@ -27,24 +30,26 @@ def getFiles(currentPath):
 def scrapeURLData(apiURL):
     #Declare a header dictionary, which makes the bot look human and prevent 403 errors
     headers = {
+        #No 'user-agent' or 'sec-ch-ua' here on purpose. SofaScore rejects stale Chrome
+        #UA strings outright: measured 2026-09-27 on an otherwise identical request,
+        #Chrome/149 got 200 while Chrome/144, /142 and /120 all got 403. Pinning a
+        #version just restarts that clock, and overriding the UA while curl_cffi
+        #impersonates a different browser is self-contradictory anyway. Leaving these
+        #out lets curl_cffi send the UA and client hints matching IMPERSONATE.
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9',
         'cache-control': 'max-age=0',
         'priority': 'u=1, i',
         'referer': 'https://www.sofascore.com/',
-        'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
         'sec-fetch-dest': 'empty',
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
         'x-requested-with': '5d7735',
     }
 
     for attempt in range(3):
         try:
-            response = requests.get(apiURL, headers=headers, impersonate="chrome120", timeout=30)
+            response = requests.get(apiURL, headers=headers, impersonate=Request_Utils.CurrentProfile(headers), timeout=30)
         except Exception as e:
             print(f"Request failed ({e}), retrying... attempt {attempt+1}")
             time.sleep(5 * 2 ** attempt)
@@ -111,13 +116,24 @@ def _responseReason(response):
         return body['error'].get('reason', 'unknown')
     return 'unknown'
 #%%
-def loadMatchData(leagues, team, date):
-    year = date.split('-')[2]
+def loadMatchData(leagues, team, date, extraSeasons=0):
+    '''Every scraped match for `team` before `date`, keyed by folder name.
+
+    extraSeasons reaches back that many prior calendar years as well. It defaults to 0, so every
+    existing caller keeps loading exactly the one season it always did — widening the window
+    silently would corrupt every per-90 in the report, which all divide by minutes drawn from
+    whatever this returns. Only the penalty charts opt in (see generateFourthPage): their keys are
+    pure counts and sums, so they are the one place a longer window costs nothing.
+
+    Matches are still de-duplicated by SofaScore match ID across the whole window, and the
+    chronological sort works across years because folder names carry a full M-D-YYYY date.'''
+    year = int(date.split('-')[2])
+    years = [str(year - offset) for offset in range(extraSeasons + 1)]
     matches = {}
 
     seenMatchIDs = set()
-    for league in leagues:
-        teamPath = f'/Users/jakeholfinger/Desktop/CC Analyst/Data/SofaScore_Data/{year}_Data/{league.replace(" ", "_")}_Data/{team.replace(" ", "_")}_Data'
+    for season, league in ((s, l) for s in years for l in leagues):
+        teamPath = f'/Users/jakeholfinger/Desktop/CC Analyst/Data/SofaScore_Data/{season}_Data/{league.replace(" ", "_")}_Data/{team.replace(" ", "_")}_Data'
         if not os.path.exists(teamPath):
             continue
         for matchFolder in getFiles(teamPath):
@@ -191,9 +207,37 @@ def findOppositionTeamID(leagueFolders, opposition, year):
             break  # found the opposition's folder for this league; no need to keep scanning
     return None
 #%%
-def scrapeTargetMatchData(leagues, opposition, date):
+def namesLikelySameTeam(localName, apiName):
+    '''Whether two team names plausibly refer to the same club.
+
+    Local folder names and SofaScore's names agree often but not always ("Columbus Crew" vs
+    "Columbus Crew SC", accents, suffixes like CF/FC/SC). An exact comparison would reject real
+    fixtures, so fall back to significant-word overlap after stripping the generic club suffixes
+    that carry no identifying information.'''
+    if not localName or not apiName:
+        return False
+
+    NOISE = {'fc', 'sc', 'cf', 'afc', 'cd', 'club', 'de', 'the', 'ii'}
+
+    def tokens(name):
+        cleaned = re.sub(r'[^\w\s]', ' ', unicodedata.normalize('NFKD', str(name))
+                         .encode('ascii', 'ignore').decode()).lower()
+        return {word for word in cleaned.split() if word and word not in NOISE}
+
+    localTokens, apiTokens = tokens(localName), tokens(apiName)
+    if not localTokens or not apiTokens:
+        return False
+
+    #Either name's distinctive words being wholly contained in the other's is a match: this
+    #accepts "Columbus Crew" vs "Columbus Crew SC" while still rejecting "Inter Miami" vs
+    #"San Diego", which share no distinctive word at all.
+    return localTokens <= apiTokens or apiTokens <= localTokens
+
+#%%
+def scrapeTargetMatchData(leagues, opposition, date, team=None):
     # Added `date` parameter — was previously read from outer scope (a scoping bug)
     oppositionName = opposition.replace('_', ' ')
+    teamName = team.replace('_', ' ') if team else None
 
     # Find the opposition's SofaScore team ID by locating their own folder
     # somewhere in the league's locally saved data (not the focus team's match
@@ -241,6 +285,26 @@ def scrapeTargetMatchData(leagues, opposition, date):
                 # play two matches within a day of each other, so the window is unambiguous.
                 matchDate = datetime.fromtimestamp(match.get('startTimestamp', 0), tz=timezone.utc).date()
                 if abs((matchDate - targetDate.date()).days) <= 1:
+                    # The window finds a match on roughly the right DATE, which is not the same as
+                    # finding the right FIXTURE. This endpoint lists every match the opposition
+                    # plays, so a wrong date silently returns whoever they happened to face that
+                    # week and the whole report is built about the wrong game — measured
+                    # 2026-09-27, asking for Columbus Crew vs Inter Miami on 9-19 returned
+                    # 'Inter Miami CF vs San Diego FC' on 9-20 and produced a complete report
+                    # carrying that match's date, kickoff time and venue. It also poisons the team
+                    # colour database, because generatePageTemplate then resolves teamID to a side
+                    # that isn't either of the two teams the caller asked about.
+                    #
+                    # So confirm the focus team is actually in it. Names are compared loosely
+                    # because local folder names don't always match SofaScore's exactly.
+                    if teamName is not None:
+                        sides = [match.get('homeTeam', {}).get('name', ''),
+                                 match.get('awayTeam', {}).get('name', '')]
+                        if not any(namesLikelySameTeam(teamName, side) for side in sides):
+                            print(f'Skipping {sides[0]} vs {sides[1]} on {matchDate}: within a day of '
+                                  f'{date} but {teamName} is not playing in it.')
+                            continue
+
                     matchID = match.get('id', None)
                     if matchID:
                         matchAPIURL = f'https://www.sofascore.com/api/v1/event/{matchID}'
@@ -261,7 +325,11 @@ def scrapeTargetMatchData(leagues, opposition, date):
                   f'— see the error above. The fixture may well exist; we never got a list to '
                   f'search. Locally cached match data is unaffected.')
         else:
-            print(f'No match found for {oppositionName} on {date}')
+            if teamName is not None:
+                print(f'No match found between {teamName} and {oppositionName} within a day of {date}. '
+                      f'Check the date — a fixture on a different date will NOT be used.')
+            else:
+                print(f'No match found for {oppositionName} on {date}')
         return None
 
     return matchData
@@ -675,6 +743,76 @@ def fitTextToWidth(page, textArtist, maxWidthFraction=0.94, minFontSize=11):
 
     return textArtist
 #%%
+# Rightmost a line of body text may reach. drawFigureLine already spans 0.018..0.982, which is the
+# inside of the printed border, so this keeps a value clear of it by 0.012 — about 7pt.
+PAGE_TEXT_RIGHT_LIMIT = 0.970
+
+def drawLabelledValue(page, x, y, label, value, fontsize, rightLimit=PAGE_TEXT_RIGHT_LIMIT,
+                      minFontSize=11):
+    """Draw "Label: value" as TWO artists so only the value can shrink.
+
+    A single text artist would have to shrink whole, which drops the label out of step with the
+    others in its column — "Style Of Play" set smaller than "Primary Formation" directly above it
+    reads as a mistake rather than as a fit. Splitting them keeps every label on the page at one
+    size and spends the space on the part that actually varies.
+
+    The value starts where the label ends, measured rather than assumed: at fontsize 18 the label
+    widths differ by several characters between rows, and a fixed offset would either overlap the
+    label or leave a visible gap.
+
+    Returns (labelArtist, valueArtist).
+    """
+    labelArtist = page.text(x, y, label, fontsize=fontsize)
+    try:
+        renderer = page.canvas.get_renderer()
+    except AttributeError:
+        # No renderer before the figure is saved on some backends. Fail open the way
+        # fitTextToWidth does: draw the value at the requested size, unmeasured.
+        return labelArtist, page.text(x, y, f'{" " * len(label)}{value}', fontsize=fontsize)
+
+    valueX = x + labelArtist.get_window_extent(renderer).width / page.bbox.width
+    valueArtist = page.text(valueX, y, value, fontsize=fontsize)
+    # fitTextToWidth measures the artist's own width against a fraction of the page, so the
+    # fraction to hand it is what is left between where the value starts and the border.
+    fitTextToWidth(page, valueArtist, maxWidthFraction=max(rightLimit - valueX, 0.0),
+                   minFontSize=minFontSize)
+    return labelArtist, valueArtist
+def fitTextToDataWidth(page, textArtist, axes, dataWidth, minFontSize=3.5):
+    """Shrinks textArtist until it fits within `dataWidth` units of `axes`' own x scale.
+
+    The sibling fitTextToWidth measures against the FIGURE, which is the right frame for a header
+    line running across the page. This one measures against a box drawn in an axes' data
+    coordinates, which is what the lineup cards need: a name bar is 20 units of a 0-100 pitch, and
+    what it can hold depends on how big that pitch happens to be drawn.
+
+    Resolution-independent despite mixing units. A text extent in pixels scales with the figure's
+    dpi, and so does the axes' data-to-pixel transform, so the ratio between the two is the same
+    whatever dpi the page is finally saved at.
+
+    minFontSize is a floor, and below it the name is left overflowing rather than shrunk to
+    something nobody can read — the same call fitTextToWidth makes, on the grounds that a visibly
+    wrong layout gets fixed and silently illegible text does not.
+    """
+    try:
+        renderer = page.canvas.get_renderer()
+    except AttributeError:
+        # Not every backend exposes a renderer before the figure is saved; leave the text alone.
+        return textArtist
+
+    (left, __), (right, __) = axes.transData.transform([(0, 0), (dataWidth, 0)])
+    available = abs(right - left)
+
+    fontSize = textArtist.get_fontsize()
+    # Quarter-point steps rather than the header fitter's half: these cards start at 7pt, so a
+    # half-point is already a 7% jump and lands visibly short of the room actually available.
+    while fontSize > minFontSize:
+        if textArtist.get_window_extent(renderer).width <= available:
+            break
+        fontSize -= 0.25
+        textArtist.set_fontsize(fontSize)
+
+    return textArtist
+#%%
 def fitBoxToAspect(imgShape, maxWidth, maxHeight):
     '''Returns (width, height) in figure-fraction units that preserve imgShape's aspect
     ratio while maximizing size within the (maxWidth, maxHeight) ceiling.'''
@@ -684,6 +822,88 @@ def fitBoxToAspect(imgShape, maxWidth, maxHeight):
     if imgAspect > maxAspect:
         return maxWidth, maxWidth / imgAspect
     return maxHeight * imgAspect, maxHeight
+#%%
+# The furthest out a crest may be pushed before the header type has to give way instead. The white
+# area of the page begins at (SEC_W + PRI_W)/(72*8.5) = 0.018, so this leaves a gap of 0.012 —
+# about 7pt — between a crest and the printed border. Past that a crest reads as falling off the
+# page, which is a worse fault than a line of type half a point smaller.
+HEADER_LOGO_MIN_X = 0.030
+
+# Kept between the inner edge of a crest and the end of a header line. Purely visual: at zero the
+# two touch and read as one object rather than as a crest beside a title.
+#
+# 0.024 of page width is about 15pt, roughly 0.6 of the 25pt the opponent's name is set in, which
+# is what makes it read as a deliberate gap rather than as a near miss. It is nearly free: swept
+# against every MLS opponent, three competitions and both real crest shapes, the tall Columbus
+# Crew crest (446x250) still needs no shrinking anywhere up to a gap of 0.032, and the square
+# crest — which has almost no travel and so shrinks whatever this is set to — costs one point of
+# type against the old 0.008 (22.5pt to 21.5pt). Past 0.036 the tall crest runs out of page too
+# and every report starts paying.
+HEADER_LOGO_TEXT_GAP = 0.024
+
+def clearHeaderLogos(page, headerLines, logoCentreX, logoWidth, logoCentreY, logoHeight):
+    '''Keep the header lines clear of the two club crests. Returns the LEFT crest's centre x; the
+    right one mirrors it at 1 - x.
+
+    Both crests sat at a fixed 0.11 and 0.89 before this, which a long opponent name simply ran
+    into: "VS NEW ENGLAND REVOLUTION" measures 0.727 of page width at fontsize 25, spanning
+    0.137-0.863, against crests that reach 0.175 and 0.825 at full size. That is an overlap of
+    0.038 a side, and it is not a rare case — "AT CONCACAF CHAMPIONS CUP" and
+    "VS VANCOUVER WHITECAPS FC" are as wide, and the kickoff line clears by only 0.005.
+
+    Two moves, in the order that costs the reader least. FIRST the crests slide outward, which
+    costs nothing — they are decoration and the page has margin there. Only once they reach
+    HEADER_LOGO_MIN_X and a line still will not fit does the TYPE give way, shrunk by
+    fitTextToWidth until it clears. Which of the two is enough depends on the crest: a narrow one
+    has 0.045 of travel and never needs the second move, while a full-width 0.13 crest has 0.015
+    and leaves the longest names about two points to lose.
+
+    The crests move TOGETHER and symmetrically. The header is centred, so one crest nearer its
+    edge than the other reads as a mistake rather than as a fit.
+
+    Every header line level with the crests is considered, not just the opponent's name, because
+    moving a crest clears all of them at once and the widest is the one that binds. Level is
+    measured from the drawn extents rather than assumed from the y positions: at fontsize 30
+    "PRE-MATCH REPORT" rises well into the crests' band even though its anchor sits above it.
+
+    Crests never move INWARD. Where nothing conflicts the header keeps the layout it always had.'''
+    try:
+        renderer = page.canvas.get_renderer()
+    except AttributeError:
+        # Not every backend exposes a renderer before the figure is saved. Fail open and leave the
+        # header alone, exactly as fitTextToWidth does.
+        return logoCentreX
+
+    logoTop, logoBottom = logoCentreY + logoHeight / 2, logoCentreY - logoHeight / 2
+
+    def linesLevelWithLogos():
+        level = []
+        for line in headerLines:
+            box = line.get_window_extent(renderer)
+            if (box.y0 / page.bbox.height) < logoTop and (box.y1 / page.bbox.height) > logoBottom:
+                level.append((box.width / page.bbox.width, line))
+        return sorted(level, key=lambda item: -item[0])
+
+    level = linesLevelWithLogos()
+    if not level:
+        return logoCentreX
+
+    # Where the crest's centre would have to sit for the widest line to clear it, and the furthest
+    # out it is allowed to go.
+    wanted = 0.5 - level[0][0] / 2 - HEADER_LOGO_TEXT_GAP - logoWidth / 2
+    limit = HEADER_LOGO_MIN_X + logoWidth / 2
+    logoCentreX = max(limit, min(logoCentreX, wanted))
+
+    if wanted < limit:
+        # Out of travel, so the type gives way. Measured against the gap the crests actually leave,
+        # and applied per line, so a short line at the same height is never shrunk to match a long
+        # one it does not share a problem with.
+        allowed = 2 * (0.5 - (logoCentreX + logoWidth / 2) - HEADER_LOGO_TEXT_GAP)
+        for width, line in level:
+            if width > allowed:
+                fitTextToWidth(page, line, maxWidthFraction=allowed)
+
+    return logoCentreX
 #%%
 def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
 
@@ -736,10 +956,11 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
     # away trip across a zone boundary is exactly when both numbers matter, and showing only one
     # leaves a reader to work out which it was. The zone abbreviations distinguish them.
     #
-    # The bracketed half is kept terse because this line is the widest thing in the header and it
-    # runs BETWEEN the two club logos, which sit at x=0.074-0.147 and x=0.854-0.927 — 0.707 of
-    # page width to play with. A spelled-out "(7:30 PM CDT at venue)" measured 0.788 wide and
-    # cleared the logos by 0.002 vertically, which is not clearance, it is luck.
+    # The bracketed half is kept terse because this line runs BETWEEN the two club logos, and at
+    # 0.641 of page width it is one of the widest things in the header. A spelled-out
+    # "(7:30 PM CDT at venue)" measured 0.788. clearHeaderLogos now guards the collision rather
+    # than leaving it to luck, but every character kept off this line is a character the crests do
+    # not have to be pushed out of the way to make room for.
     if kickoffTimestamp is None:
         kickoffTime = 'TBD'
     else:
@@ -810,15 +1031,18 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
                                transform=page.transFigure, zorder=-1))
 
     # --- HEADER ---
-    # Large centered title
-    page.text(0.5, 0.950, 'PRE-MATCH REPORT', ha='center', fontsize=30, fontweight='bold')
-    # Competition name and round (e.g. "MLS Regular Season")
-    page.text(0.5, 0.9125, f'{competitionName.upper()} {competitionRound.upper()}', ha='center', fontsize=19)#, fontweight='bold')
-    # "VS" for home games, "AT" for away games, followed by all-caps opponent name
-    homeIndicator = 'VS' if isHome else 'AT'
-    page.text(0.5, 0.8725, f'{homeIndicator} {oppositionName.upper()}', ha='center', fontsize=25, fontweight='bold')
-    # Kickoff date/time with local timezone abbreviation
-    page.text(0.5, 0.835, kickoffTime, ha='center', fontsize=19)#, fontweight='bold')
+    # Kept as artists rather than drawn and forgotten: clearHeaderLogos measures them to decide
+    # where the crests can go, and shrinks them if the crests run out of room.
+    headerLines = [
+        # Large centered title
+        page.text(0.5, 0.950, 'PRE-MATCH REPORT', ha='center', fontsize=30, fontweight='bold'),
+        # Competition name and round (e.g. "MLS Regular Season")
+        page.text(0.5, 0.9125, f'{competitionName.upper()} {competitionRound.upper()}', ha='center', fontsize=19),#, fontweight='bold')
+        # "VS" for home games, "AT" for away games, followed by all-caps opponent name
+        page.text(0.5, 0.8725, f'{"VS" if isHome else "AT"} {oppositionName.upper()}', ha='center', fontsize=25, fontweight='bold'),
+        # Kickoff date/time with local timezone abbreviation
+        page.text(0.5, 0.835, kickoffTime, ha='center', fontsize=19),#, fontweight='bold')
+    ]
 
     # Team logos: placed using add_axes([left, bottom, width, height]) so we can
     # call imshow() on them. axis('off') removes the axes border/ticks.
@@ -828,16 +1052,17 @@ def generatePageTemplate(team, opposition, targetMatch, frontPage=False):
         logoWidth, logoHeight = fitBoxToAspect(teamLogo.shape, maxLogoWidth, maxLogoHeight)
 
         #axLeft = page.add_axes([0.07, 0.840, 0.09, 0.13])
-        leftTargetX = 0.11
-        leftTargetY = 0.9
-        axLeft = page.add_axes([(leftTargetX-(logoWidth/2)), (leftTargetY-(logoHeight/2)), logoWidth, logoHeight])
+        logoTargetY = 0.9
+        # 0.11 is where the crests sit when nothing is in their way; a long header line pushes them
+        # outward from there, and shrinks itself if they run out of page. See clearHeaderLogos.
+        leftTargetX = clearHeaderLogos(page, headerLines, 0.11, logoWidth, logoTargetY, logoHeight)
+        axLeft = page.add_axes([(leftTargetX-(logoWidth/2)), (logoTargetY-(logoHeight/2)), logoWidth, logoHeight])
         axLeft.imshow(teamLogo)
         axLeft.axis('off')
 
         #axRight = page.add_axes([0.82, 0.840, 0.09, 0.13])
-        rightTargetX = 0.89
-        rightTargetY = 0.9
-        axRight = page.add_axes([(rightTargetX-(logoWidth/2)), (rightTargetY-(logoHeight/2)), logoWidth, logoHeight])
+        rightTargetX = 1 - leftTargetX
+        axRight = page.add_axes([(rightTargetX-(logoWidth/2)), (logoTargetY-(logoHeight/2)), logoWidth, logoHeight])
         # TODO: Pick which logo to show
         axRight.imshow(teamLogo)
         #axRight.imshow(oppositionLogo)
@@ -921,12 +1146,24 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
     matches = dict(sorted(matches.items(),
         key=lambda item: datetime.strptime(item[0].split('_')[0], '%m-%d-%Y')))
 
-    # Get the last 5 results: W/D/L from the opposition's perspective
+    # Get the last 5 results: W/D/L from the opposition's perspective.
+    #
+    # Filter for Match_Attributes.csv BEFORE taking the last five, not after. Slicing first and
+    # skipping incomplete folders inside the loop silently returned fewer than five results —
+    # measured 2026-09-27, the Crew's form read as four matches because their most recent folder
+    # (9-19-2026_vs_CF_Montréal) was scraped without Match_Attributes.csv, so it was sliced in and
+    # then dropped. A short form line looks like a team that has only played four times rather
+    # than like missing data, which is the worst way for this to fail.
+    playedMatches = [(folder, files) for folder, files in matches.items()
+                     if files.get('Match_Attributes.csv') is not None]
+    if len(playedMatches) < len(matches):
+        incomplete = [f for f, files in matches.items() if files.get('Match_Attributes.csv') is None]
+        print(f'Note: {len(incomplete)} {oppositionName} match folder(s) have no Match_Attributes.csv '
+              f'and are excluded from form/standings: {incomplete}. Re-scrape them for accurate results.')
+
     form = []
-    for matchFolder, matchFiles in list(matches.items())[-5:]:
+    for matchFolder, matchFiles in playedMatches[-5:]:
         attrs = matchFiles.get('Match_Attributes.csv')
-        if attrs is None:
-            continue
         winnerCode = attrs['winnerCode'].iloc[0]
         homeTeamName = attrs['homeTeam.name'].iloc[0]
         # winnerCode 1 = home win, 2 = away win, 0 = draw
@@ -1035,9 +1272,30 @@ def generateMatchOverview(leagues, opposition, date, matches, page, teamColors):
     # See Indentify_Style_Of_Play.main for what goes into that flag.
     archetype = styleOfPlay.get('primary_archetype') if styleOfPlay else None
     styleLabel = archetype or 'N/A'
+    # BOTH names when the two are close. Nearest-centroid always returns something, so a team with
+    # no distinguishable style otherwise reads exactly like one with a pronounced one — see
+    # Indentify_Style_Of_Play.STYLE_AMBIGUOUS_MARGIN for where the line is drawn and why. Nearest
+    # first, so the pair still says which way the team leans.
+    #
+    # Joined with " or ", NOT with a slash: one of the archetypes is itself called Wide/Crossing,
+    # so a slash separator printed New England as "Wide/Crossing / Counter-Attack" — which reads
+    # as three styles, with the two slashes spaced differently to compound it. "or" also says
+    # plainly what the pair means, which a punctuation mark leaves the reader to infer.
+    if archetype and styleOfPlay.get('archetype_ambiguous'):
+        runnerUp = styleOfPlay.get('secondary_archetype')
+        if runnerUp:
+            styleLabel = f'{archetype} or {runnerUp}'
     if archetype and styleOfPlay.get('limited'):
         styleLabel += ' (limited data)'
-    page.text(0.450, 0.580, f'Style Of Play: {styleLabel}', fontsize=18)
+    # A floor of 7.5 rather than fitTextToWidth's usual 11, measured against the worst string this
+    # line can actually be asked to hold. Every archetype, every ordered pair of them and every one
+    # of those with the suffix is 99 strings; the longest is
+    # "Counter-Attack / Vertical Possession (limited data)" at 51 characters, and from where the
+    # label leaves it that needs 7.5pt to clear the border. At 11 it ran off the page ENTIRELY,
+    # which is a worse fault than small type, and it is a real combination — a competition thin
+    # enough to set 'limited' is no less likely to produce a close pair than a full one.
+    drawLabelledValue(page, 0.450, 0.580, 'Style Of Play: ', styleLabel, fontsize=18,
+                      minFontSize=7.5)
     #page.text(0.500, 0.579, 'Win Probability: N/A', fontsize=22.5)
 
     drawFigureLine(page, teamColors[1], y=0.550)
@@ -1200,6 +1458,10 @@ def generatePredictedLineup(leagues, opposition, date, page, formationOverride=F
     NUM_W = 0.30 * CW   # number box  (left 25 %)
     RAT_W = 0.40 * CW   # rating box  (centre 50 %)
     POS_W = 0.30 * CW   # position box (right 25 %)
+    # Share of the name bar a surname may occupy. The remainder is breathing room at each end: a
+    # name fitted to the bar's exact width touches the black on both sides and reads as clipped
+    # even when every letter is there.
+    NAME_BAR_FILL = 0.92
 
     def getRatingColor(rating, sofascore=True):
         if sofascore:
@@ -1251,8 +1513,13 @@ def generatePredictedLineup(leagues, opposition, date, page, formationOverride=F
         # Name bar (bottom, full card width)
         fieldAxis.add_patch(Rectangle((xCoord - HW, yCoord - HH), width=CW, height=HH,
                                       linewidth=0.5, edgecolor='black', facecolor='black', zorder=3))
-        fieldAxis.text(xCoord, yCoord - HH / 2, lastName,
+        nameText = fieldAxis.text(xCoord, yCoord - HH / 2, lastName,
                        fontsize=7, color='white', fontweight='bold', ha='center', va='center', zorder=4)
+        # The bar is CW units wide but only about 49pt on the page, which holds roughly eleven
+        # characters at 7pt bold — so a long surname ran out past the black on both sides and sat
+        # on the grass. Shrink to fit rather than truncate: a cut-off surname is a different
+        # player's name, which is worse than a small one. NAME_BAR_FILL keeps it off the edges.
+        fitTextToDataWidth(page, nameText, fieldAxis, CW * NAME_BAR_FILL)
 
     page.text(0.75,  0.45, 'Expected Subs', ha='center', fontsize=22.5, fontweight='bold')
 
@@ -1429,6 +1696,11 @@ def generateThirdPage(leagues, team, opposition, targetMatch, date, expectedLine
     return page, notesFields
 
 #%%
+# How many prior seasons the penalty charts reach back over. One: only 2025 and 2026 are scraped,
+# so this is everything there is, and it roughly doubles-to-quintuples a squad's penalty count on
+# MLS. Deliberately NOT applied to any other chart — see the note at the call site.
+PENALTY_EXTRA_SEASONS = 1
+
 def generateFourthPage(leagues, team, opposition, targetMatch, date,
                        expectedLineup=None, expectedSubs=None):
     '''Set pieces. Two pairs, each offence on the left and defence on the right: corners taken and
@@ -1461,13 +1733,25 @@ def generateFourthPage(leagues, team, opposition, targetMatch, date,
     # column, including the keeper table describing the conceded chart's marks. It hands back the
     # colours that table used, so the conceded chart's marks match it, and whether this competition
     # carries xGOT — judged over both directions rather than from the conceded side's few penalties.
+    #
+    # These two get a WIDER window than every other chart on the report: penalties are rare enough
+    # that one season barely fills a chart — Nashville take three in 2026 and seventeen across two,
+    # Columbus four and ten. They are also the only charts that can safely take it, because their
+    # keys are counts and sums with no per-90 anywhere; every other chart divides by minutes drawn
+    # from `oppositionMatches` and would be corrupted by a longer window. Players who have since
+    # left still get greyed by player_qualifier's current-squad check, which is the case it exists
+    # for. Where no prior season is scraped — Liga MX has none — this simply returns the same
+    # matches and the charts say nothing about it.
+    penaltyMatches = loadMatchData(leagues, opposition, date,
+                                   extraSeasons=PENALTY_EXTRA_SEASONS)
+
     page, penaltyNotesBbox, penaltyXgAvailable, penaltyKeeperColors = (
         Tactical_Visualizations.generate_penalty_map(
-            leagues, opposition, oppositionMatches, date, teamColors, page,
+            leagues, opposition, penaltyMatches, date, teamColors, page,
             expected_lineup=expectedLineup, expected_subs=expectedSubs))
 
     page, defPenaltyNotesBbox = Tactical_Visualizations.generate_def_penalty_map(
-        leagues, opposition, oppositionMatches, date, teamColors, page,
+        leagues, opposition, penaltyMatches, date, teamColors, page,
         keeper_colors=penaltyKeeperColors, xg_available=penaltyXgAvailable,
         expected_lineup=expectedLineup, expected_subs=expectedSubs)
 
@@ -1482,15 +1766,74 @@ def generateFourthPage(leagues, team, opposition, targetMatch, date,
     return page, notesFields
 
 #%%
-def main(leagues=['MLS', 'Liga_MX,_Apertura', 'Leagues_Cup'], team='Club_América', opposition='Columbus_Crew', date='8-26-2026', formationOverride=False):
-#def main(leagues=['NCAA'], team='DePaul_Blue_Demons', opposition='Ohio_State_Buckeyes', date='8-24-2026', formationOverride=False):
+def moveExistingReportToTrash(path):
+    """Move a report that is about to be replaced to the Trash. True if it is no longer at `path`.
+
+    Overwriting was the previous behaviour and it is unrecoverable, which matters more here than
+    it looks: pages two to four carry real AcroForm notes fields (see PDF_Form_Fields), so the
+    copy being replaced can hold typed match notes that exist nowhere else. Regenerating a report
+    for the same opponent and date — to pick up a lineup change, or a scrape that failed the
+    first time — silently destroyed them.
+
+    send2trash is preferred because it goes through the platform's own API rather than moving the
+    file by hand. On macOS that is NSFileManager's trashItemAtURL:, which records the move so the
+    file keeps its Finder "Put Back" entry and returns to this folder in one step.
+
+    SUCCESS IS CONFIRMED BY THE SOURCE BEING GONE, not by send2trash returning quietly — it
+    returns None either way — and not by looking for the file in the Trash, which is not something
+    this process can rely on doing: macOS gates even listing ~/.Trash behind Full Disk Access, so
+    os.listdir on it raises PermissionError from an ordinary Python run. Checking the path we
+    started from needs no such permission and is the thing actually being asserted.
+
+    For the same reason no destination is returned. The OS de-duplicates a name already in the
+    Trash, so any path built here would be a guess, and printing a guessed path to a user trying
+    to recover a file is worse than telling them plainly that it is in the Trash.
+
+    The manual fallback exists so a machine without the package still gets a recoverable copy
+    instead of quietly reverting to a destructive overwrite. It lands the file in the same Trash
+    but registers nothing, so it has no Put Back and has to be dragged out. It de-duplicates its
+    own name the way Finder does, by appending the time: two reports trashed for one fixture would
+    otherwise have the second overwrite the first, which is the exact loss this exists to prevent.
+    """
+    if not os.path.exists(path):
+        return False
+
+    try:
+        from send2trash import send2trash
+        send2trash(path)
+    except Exception:
+        pass
+    if not os.path.exists(path):
+        return True
+
+    trashDir = os.path.expanduser('~/.Trash')
+    if not os.path.isdir(trashDir):
+        return False
+
+    stem, extension = os.path.splitext(os.path.basename(path))
+    destination = os.path.join(trashDir, stem + extension)
+    # os.path.exists on a known path is allowed where listing the directory is not, so this
+    # collision check still works under the restriction described above.
+    if os.path.exists(destination):
+        destination = os.path.join(
+            trashDir, f'{stem} {datetime.now().strftime("%H.%M.%S")}{extension}')
+    try:
+        shutil.move(path, destination)
+    except Exception:
+        return False
+    return not os.path.exists(path)
+#%%
+def main(leagues=['MLS', 'Leagues_Cup', 'US_Open_Cup', 'CONCACAF_Champions_Cup'], team='Columbus_Crew', opposition='Inter_Miami_CF', date='9-27-2026', formationOverride=False):
+                #'Liga_MX,_Apertura', 
+#def main(leagues=['NCAA'], team='Ohio_State_Buckeyes', opposition='Washington_Huskies', date='9-21-2026', formationOverride=False):
     # Note: first value of leagues must be the opposition's primary league
     # formationOverride: pass a boolean that determines whether the deduced formation should be used or the user should input it
     # Note: date format is 'M-D-YYYY'
     
+    
     matches = loadMatchData(leagues, team, date)
 
-    targetMatch = scrapeTargetMatchData(leagues, opposition, date)
+    targetMatch = scrapeTargetMatchData(leagues, opposition, date, team=team)
     if targetMatch is None:
         print(f'Could not retrieve match data for {opposition} on {date}. Aborting report.')
         return
@@ -1498,6 +1841,15 @@ def main(leagues=['MLS', 'Liga_MX,_Apertura', 'Leagues_Cup'], team='Club_Améric
     outputDir = '/Users/jakeholfinger/Desktop/CC Analyst/Prematch Reports'
     os.makedirs(outputDir, exist_ok=True)
     outputPath = os.path.join(outputDir, f'Pre_Match_Report_{opposition}_{date}.pdf')
+    # BEFORE PdfPages, which truncates the path the moment it opens it. Anything already there is
+    # a previous run for this same fixture, and it goes to the Trash rather than being written
+    # over — see moveExistingReportToTrash for why that is worth doing.
+    if os.path.exists(outputPath):
+        if moveExistingReportToTrash(outputPath):
+            print(f'Existing report moved to the Trash: {os.path.basename(outputPath)}')
+        else:
+            print(f'WARNING: could not move the existing report to the Trash — '
+                  f'{outputPath} is about to be OVERWRITTEN and any notes in it lost.')
     with PdfPages(outputPath) as pdf:
         pageOne, expectedLineup, expectedSubs = generateFirstPage(leagues, team, opposition, date, matches, targetMatch, formationOverride=formationOverride)
         pdf.savefig(pageOne)

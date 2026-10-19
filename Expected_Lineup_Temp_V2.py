@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 from curl_cffi import requests
+import Request_Utils
 import time
 from scipy.stats import linregress
 from xgboost import XGBClassifier, XGBRegressor
@@ -23,18 +24,20 @@ def GetFiles(currentPath):
 def getURLData(apiURL):
     #Declare a header dictionary, which makes the bot look human and prevent 403 errors
     headers = {
+        #No 'user-agent' or 'sec-ch-ua' here on purpose. SofaScore rejects stale Chrome
+        #UA strings outright: measured 2026-09-27 on an otherwise identical request,
+        #Chrome/149 got 200 while Chrome/144, /142 and /120 all got 403. Pinning a
+        #version just restarts that clock, and overriding the UA while curl_cffi
+        #impersonates a different browser is self-contradictory anyway. Leaving these
+        #out lets curl_cffi send the UA and client hints matching IMPERSONATE.
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9',
         'cache-control': 'max-age=0',
         'priority': 'u=1, i',
         'referer': 'https://www.sofascore.com/',
-        'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
         'sec-fetch-dest': 'empty',
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
         'x-requested-with': '5d7735',
         #'If-Modified-Since': 'Sat, 14 Feb 2026 00:00:00 GMT'
     }
@@ -42,7 +45,7 @@ def getURLData(apiURL):
     response = None
     for attempt in range(3):
         try:
-            response = requests.get(apiURL, headers=headers, impersonate="chrome120", timeout=30)
+            response = requests.get(apiURL, headers=headers, impersonate=Request_Utils.CurrentProfile(headers), timeout=30)
             break  # success, exit loop
         except requests.exceptions.Timeout:
             print(f"Timeout, retrying... attempt {attempt+1}")
@@ -513,6 +516,37 @@ def collapseEquivalentFormations(formationSeries):
     the vote for that shape gets split across two labels and understates its true frequency.'''
     return formationSeries.replace('3-4-2-1', '3-4-3')
 
+# Games-ago half-life for the formation vote. Same decay shape as SLOT_RECENCY_HALF_LIFE but much
+# shorter, because a shape change is a deliberate switch a manager makes and sticks with, whereas
+# an individual's settled role drifts slowly. At 2 the last match counts 1.0, two back 0.5 and
+# four back 0.25, so a run of two or three matches in a new shape outvotes a formation used more
+# often earlier in the season. A plain unweighted mode (what this used to be) could never do that:
+# the Crew's 24 season-long 4-4-2s outvoted their three most recent back-three games indefinitely.
+#
+# Value chosen by backtest over 2026 Crew + Inter Miami (59 matches), predicting each match's
+# formation from only prior matches — mean accuracy: half-life 2 = 57.1%, 3/4/5 = 53.3%, 8 = 49.9%,
+# unweighted mode = 44.8%. The win is lopsided by team (Miami 25.0% -> 46.4%, Crew 64.5% -> 67.7%),
+# and the Crew alone would slightly prefer 3-5 (71.0% vs 67.7%, a one-match difference), so 2 is
+# the best mean rather than the best everywhere. Two teams is a thin sample; revisit if it misses.
+FORMATION_RECENCY_HALF_LIFE = 2
+
+def recencyWeightedFormation(formations, halfLife=FORMATION_RECENCY_HALF_LIFE):
+    '''Most-used formation with recent matches weighted more heavily, or None if there are none.
+
+    `formations` must be ONE ROW PER MATCH in chronological order (oldest first) — a per-player
+    frame would count each match once per player, which is harmless for an unweighted mode but
+    silently wrong here, since position in the series is what sets the weight.
+    '''
+    collapsed = collapseEquivalentFormations(formations.dropna())
+    if collapsed.empty:
+        return None
+
+    gamesAgo = np.arange(len(collapsed))[::-1]
+    weights = pd.Series(0.5 ** (gamesAgo / halfLife), index=collapsed.index)
+    #idxmax breaks exact ties toward whichever label sorts first; ties here mean genuinely
+    #equal recency-weighted usage, so there is no better answer available.
+    return normalizeFormation(weights.groupby(collapsed).sum().idxmax())
+
 def predictFormation(df, formationCol='Formation', groupByCol=None):
     '''Returns {matchID: predicted_formation} using only prior data (no leakage).
     formationCol: 'Formation' for team formation, 'Opposition Formation' for opposition.
@@ -533,18 +567,20 @@ def predictFormation(df, formationCol='Formation', groupByCol=None):
             priorFormations = groupPrior if not groupPrior.empty else priorRows[formationCol].dropna()
         else:
             priorFormations = priorRows[formationCol].dropna()
-        predictions[row['Match ID']] = (normalizeFormation(collapseEquivalentFormations(priorFormations).mode().iloc[0]) if not priorFormations.empty else '4-3-3')
+        predictions[row['Match ID']] = recencyWeightedFormation(priorFormations) or '4-3-3'
 
-    # Future matches: use all historical data (opponent-specific if available)
-    allHistoricalFormations = historicalDF[formationCol].dropna()
-    globalFallback = (normalizeFormation(collapseEquivalentFormations(allHistoricalFormations).mode().iloc[0]) if not allHistoricalFormations.empty else '4-3-3')
+    # Future matches: use all historical data (opponent-specific if available).
+    # Drawn from matchDF, not historicalDF, so each match counts ONCE — historicalDF carries a row
+    # per player, which repeated every formation 11-18 times. Harmless under an unweighted mode,
+    # but it would wreck a recency weighting, where a value's position in the series is its weight.
+    globalFallback = recencyWeightedFormation(matchDF[formationCol]) or '4-3-3'
     for matchID in df.loc[df['Is Future Match'] == True, 'Match ID'].unique():
         if groupByCol:
             futureMask = (df['Is Future Match'] == True) & (df['Match ID'] == matchID)
             groupVal   = df.loc[futureMask, groupByCol].iloc[0] if futureMask.any() else None
             if groupVal is not None:
-                groupPrior = historicalDF[historicalDF[groupByCol] == groupVal][formationCol].dropna()
-                predictions[matchID] = (normalizeFormation(collapseEquivalentFormations(groupPrior).mode().iloc[0]) if not groupPrior.empty else globalFallback)
+                groupPrior = matchDF[matchDF[groupByCol] == groupVal][formationCol]
+                predictions[matchID] = recencyWeightedFormation(groupPrior) or globalFallback
             else:
                 predictions[matchID] = globalFallback
         else:
@@ -727,6 +763,70 @@ def engineerFeatures(df):
 # narrows that gap but doesn't close it — treat these as a reasonable, not exact,
 # estimate.
 NO_HISTORY_STARTS_PRIOR = [(0.2, 0.24), (0.4, 0.33), (0.6, 0.35), (0.8, 0.38), (1.01, 0.42)]
+
+# Scale of the season-minutes tie-break added to the lineup ILP objective (see predictLineup).
+# Set to 0.0 to disable it entirely and fall back to CBC's arbitrary row-order tie-breaking.
+# Kept an order of magnitude below ROLE_AFFINITY_BONUS so role always outranks raw minutes.
+TIE_BREAK_EPSILON = 1e-6
+
+# Reward for putting a player in a slot matching a position SofaScore actually lists for them.
+#
+# Interchangeable attacking slots tie exactly: measured 2026-09-27, Josef Martínez, Santiago
+# Rodríguez and Brais Méndez all had ST primary and AML/AMR secondary at probability 1.0, so every
+# permutation of the front three scored an identical 2.000 and the solver picked one at random —
+# landing Martínez, a pure striker, at right-sided attacking mid. Their declared positions settle
+# it cleanly (Martínez ['ST'], Rodríguez ['AM','LW'], Méndez ['AM','MC']) and cost nothing to use.
+#
+# Sized to break ties WITHOUT overriding real differences. The narrowest gap between distinct
+# probabilities is ~0.0078, which the lowest tier weight (0.15) shrinks to ~0.00117; the maximum
+# total affinity across eleven slots is 11 * 5e-5 = 0.00055, comfortably under it.
+ROLE_AFFINITY_BONUS = 5e-5
+
+# Reward for a slot the player has ACTUALLY PLAYED, side included. Role affinity above is
+# side-blind by construction (DCL, DC and DCR all reduce to base role 'DC'), so it cannot tell a
+# left-sided defender from a right-sided one. When the tiers leave both sides equal — which the
+# promotion cascade can still cause for a player with little shape-matched history — this breaks
+# the tie toward the side the player demonstrably occupies. Ranked below role affinity: being a
+# striker matters more than which side of the front line you have previously stood on.
+SIDE_AFFINITY_BONUS = 2e-5
+
+def slotBaseRole(slot):
+    '''Strip the side suffix from paired slots: AML/AMR -> AM, STL/STR -> ST, DCL/DCR -> DC.
+
+    Only three-character slots are split. 'ML', 'MR', 'DL' and 'DR' are genuinely distinct wide
+    roles rather than a side-variant of 'M' or 'D', so they are left alone.
+    '''
+    slot = str(slot)
+    return slot[:2] if len(slot) == 3 and slot[-1] in ('L', 'R') else slot
+
+# How much a slot assignment is worth per tier, multiplying the player's start probability in the
+# ILP objective (see predictLineup). Secondary was 0.80, which let ANY certain starter out of
+# position outscore an in-position player below 0.79 — measured 2026-09-27 on the Crew, that put
+# Santiago Rodríguez (a No.10 who has never played full back) at left back ahead of Malte Amundsen
+# (16 appearances at DL in this very formation), because two 1.0 players in secondary slots scored
+# 0.80+0.80=1.60 against 1.00+0.141=1.14 for the natural pairing. Because the objective is a SUM
+# over eleven slots, generous out-of-position weights let the solver buy aggregate score with
+# individually absurd assignments, so playing someone out of role has to cost real value.
+# Backtested over 2026 Crew + Inter Miami on POSITIONAL accuracy (of the starters correctly
+# predicted, how many were put in the slot they actually played): 0.50/0.15 with
+# SECONDARY_REQUIRES_APPEARANCE lifted the Crew 72.2% -> 74.7% and Miami 58.6% -> 59.1%. Modest,
+# but it regresses nothing and removes assignments like the Rodríguez one above. Note the ordinary
+# backtest (testLineupPredictions) CANNOT see any of this: it scores set overlap of predicted vs
+# actual starters, so it is blind to which slot anyone was given — all four configs scored an
+# identical 6.58/11 there. Judge changes to these weights on positional accuracy, not that number.
+TIER_WEIGHTS = {'primary': 1.0, 'secondary': 0.50, 'tertiary': 0.15}
+
+# Whether 'secondary' eligibility requires the player to have ACTUALLY PLAYED that slot, demoting
+# COMPARABLE_SLOTS inferences to tertiary.
+#
+# Left OFF: this was a mis-diagnosis. COMPARABLE_SLOTS holds genuinely EQUIVALENT roles (STL/ST/STR,
+# DCL/DC/DCR, MCL/MC/MCR) — the same job under a different label depending on how many players share
+# the line — so demoting them punishes a striker for the formation having renamed his position. It
+# scored as no help in backtest (Crew unchanged, Miami +0.5pp) and actively hurt: with it on, Josef
+# Martínez's STL history made ST merely *secondary* in a 3-4-3, pushing him further from striker.
+# The real cause of Rodríguez-at-left-back was the untranslated primary slot in getEligibleSlots,
+# fixed there directly.
+SECONDARY_REQUIRES_APPEARANCE = False
 
 # Subs use a MULTIPLIER (applied to the current pool's own median raw score for
 # established candidates) rather than an absolute probability. Unlike starts, the subs
@@ -979,6 +1079,29 @@ COMPARABLE_SLOTS = {'DCL': ['DC', 'DCR'], 'DC': ['DCL', 'DCR'], 'DCR': ['DCL', '
                     'MCL': ['MC', 'MCR'], 'MC': ['MCL', 'MCR'], 'MCR': ['MCL', 'MC'],
                     'AML': ['AM', 'AMR'], 'AM': ['AML', 'AMR'], 'AMR': ['AML', 'AM'], 
                     'STL': ['ST', 'STR'], 'ST': ['STL', 'STR'], 'STR': ['STL', 'ST']}
+# Consulted ONLY when a player's primary slot does not exist in the current formation (see the
+# translation step in getEligibleSlots), never for ordinary tier expansion.
+#
+# COMPARABLE_SLOTS covers same-line relabelling (ST <-> STL/STR), but a full back moving into a
+# back three has no entry there at all, so the translation found nothing and the promotion cascade
+# flattened every tier. Measured 2026-09-27: Malte Amundsen's primary is DL (weight 4.12 from 16
+# recent 4-4-2 appearances at left back); in a 3-4-3 that produced pri={DC, DCL, DCR, ML}, making
+# all three centre-back slots equal and handing him DCR at random — a slot he has never played,
+# against 7 appearances at DCL.
+#
+# In a back three the wide centre backs ARE the full-back positions, so the translation is
+# side-preserving: left to left, right to right. Kept out of COMPARABLE_SLOTS deliberately, since
+# in a back FOUR DL and DCL are genuinely different jobs and both exist.
+CROSS_SHAPE_TRANSLATIONS = {'DL': ['DCL'], 'DR': ['DCR']}
+
+# ...but only for a player who has ALSO played centre back. Shifting inside to a back three is a
+# real positional change, not a relabelling, and plenty of full backs never make it: applied
+# unconditionally this promoted Brooks Lennon (DL/DR/ML/MR, no centre-back appearance at all)
+# straight into DCR. Requiring demonstrated experience in the destination family keeps the
+# translation to players who have actually done the job — Amundsen (DCL + DL) and Moreira
+# (DCR + DL/DR) qualify; Lennon, Herrera and Tristan Brown do not.
+CROSS_SHAPE_TRANSLATION_PREREQUISITES = {'DL': {'DC', 'DCL', 'DCR'}, 'DR': {'DC', 'DCL', 'DCR'}}
+
 SIMILAR_SLOTS = {'DL': ['DR', 'ML'], 'DR': ['DL', 'MR'],
                     'DML': ['MCL', 'MC', 'MCR'], 'DM': ['MCL', 'MC', 'MCR'], 'DMR': ['MCL', 'MC', 'MCR'],
                     'MCL': ['DML', 'DM', 'DMR', 'AML', 'AM', 'AMR'], 'MC': ['DML', 'DM', 'DMR', 'AML', 'AM', 'AMR'], 'MCR': ['DML', 'DM', 'DMR', 'AML', 'AM', 'AMR'],
@@ -1071,17 +1194,25 @@ def getEligibleSlots(row, allPlayersPlayedSlots, formationSlots, formation):
             primarySlots = {shapeMatched.groupby('slot')['weight'].sum().idxmax()}  # most-played (recency-weighted) shape-compatible slot
         secondarySlots = set(playedSlots.unique()) - primarySlots  # all other played slots
 
-        # Add comparable slots of all played slots to secondary
+        # Comparable slots are an INFERENCE from a played slot, not a record of playing there.
+        comparableSlots = set()
         for playedSlot in primarySlots | secondarySlots:
             for comparableSlot in COMPARABLE_SLOTS.get(playedSlot, []):
                 if comparableSlot not in primarySlots:
-                    secondarySlots.add(comparableSlot)
+                    comparableSlots.add(comparableSlot)
 
-        # Add similar slots of primary and secondary to tertiary
-        for playedSlot in primarySlots | secondarySlots:
+        # Expand similar slots from everything reachable so far, so raising the bar for secondary
+        # narrows which tier a slot lands in without losing the slot altogether.
+        for playedSlot in primarySlots | secondarySlots | comparableSlots:
             for similarSlot in SIMILAR_SLOTS.get(playedSlot, []):
                 if similarSlot not in primarySlots and similarSlot not in secondarySlots:
                     tertiarySlots.add(similarSlot)
+
+        if SECONDARY_REQUIRES_APPEARANCE:
+            tertiarySlots |= (comparableSlots - primarySlots - secondarySlots)
+        else:
+            secondarySlots |= comparableSlots
+            tertiarySlots -= secondarySlots
 
     # Get the player's detailed positions listed by Sofascore
     detailedPositions = row['Detailed Positions']
@@ -1109,6 +1240,36 @@ def getEligibleSlots(row, allPlayersPlayedSlots, formationSlots, formation):
         for similarSlot in SIMILAR_SLOTS.get(slot, []):
             if similarSlot not in primarySlots and similarSlot not in secondarySlots and similarSlot not in tertiarySlots:
                 tertiarySlots.add(similarSlot)
+
+    # Translate the primary slot into THIS formation's vocabulary before reducing.
+    #
+    # A role's label depends on how many players share its line: a lone striker is 'ST' in a 3-4-3
+    # but 'STL'/'STR' in a 4-4-2, and a lone centre-back is 'DC' where a pair are 'DCL'/'DCR'.
+    # Intersecting raw labels with the formation's slots therefore discarded the primary whenever
+    # the label merely differed, which fired the promotion cascade below and shunted every tier up
+    # one — turning tertiary guesses into secondary options. Measured 2026-09-27 on the Crew, that
+    # is the single cause of two separate absurdities: Santiago Rodríguez's true primary is ST
+    # (weight 1.66) which does not exist in a 4-4-2, so his tiers all promoted and DL — a mere
+    # SIMILAR_SLOTS inference off ML — became a secondary option, putting a No.10 at left back;
+    # and Josef Martínez's true primary is STL (weight 2.60) which does not exist in a 3-4-3, so
+    # AML (a label SofaScore had arbitrarily given him twice) was promoted over striker.
+    if primarySlots and not (primarySlots & formationSlotsSet):
+        everPlayed = set(playedSlots.unique()) if not playedSlots.empty else set()
+
+        def crossShapeFor(slot):
+            '''Cross-shape targets for `slot`, gated on the player having played that family.'''
+            prerequisite = CROSS_SHAPE_TRANSLATION_PREREQUISITES.get(slot)
+            if prerequisite is not None and not (everPlayed & prerequisite):
+                return []
+            return CROSS_SHAPE_TRANSLATIONS.get(slot, [])
+
+        translatedPrimary = {comparable for slot in primarySlots
+                             for comparable in (COMPARABLE_SLOTS.get(slot, []) + crossShapeFor(slot))
+                             if comparable in formationSlotsSet}
+        if translatedPrimary:
+            primarySlots   = translatedPrimary
+            secondarySlots -= translatedPrimary
+            tertiarySlots  -= translatedPrimary
 
     # Reduce each tier to only slots present in the current formation
     primarySlots   &= formationSlotsSet
@@ -1163,13 +1324,63 @@ def predictLineup(mainDF, probsDF, formation, team, opposition, home, verbose=Tr
         for s in eligibility[p]
     }
 
-    # Objective: maximize starter probability weighted by position tier.
-    # Weights are small enough to only break ties, not override probability differences.
-    TIER_WEIGHTS = {'primary': 1.0, 'secondary': 0.80, 'tertiary': 0.33}
+    # Deterministic tie-break on season minutes.
+    #
+    # The calibrator collapses a wide band of raw scores onto single steps — measured on Inter
+    # Miami 2026-09-19, NINE candidates shared the identical probability 0.058824 and the whole
+    # squad spanned only eight distinct values. When two eligible players tie on both probability
+    # and tier the objective is EXACTLY equal, and CBC then settles it by variable creation order,
+    # i.e. by probsDF row order. That put Luis Barraza (0 starts, 0 minutes) in goal ahead of
+    # Rocco Ríos Novo (8 starts, 720 minutes) purely because he sorted earlier; reversing the rows
+    # flipped the pick, which is no basis for a prediction.
+    #
+    # Season minutes is the cheapest signal that actually separates such players. It is scaled far
+    # below the smallest real probability gap so it can only ever decide an otherwise exact tie:
+    # the narrowest observed gap between distinct probabilities is ~0.0078, which the lowest tier
+    # weight (0.33) shrinks to ~0.0026, while the total tie-break across all 11 slots cannot
+    # exceed 11 * 1e-5 = 0.00011 — a ~24x margin.
+    #
+    # This does NOT fix the underlying loss of resolution in the calibration, it only stops the
+    # XI depending on DataFrame ordering. Nine players on one step is a separate problem.
+    #
+    # Ranked BELOW role affinity: a striker belongs at striker even if a team-mate has more minutes.
+    historicalRows = mainDF[mainDF['Is Future Match'] == False]
+    seasonMinutes = historicalRows.groupby('ID')['Minutes Played'].sum()
+    maxSeasonMinutes = seasonMinutes.max()
+    if not maxSeasonMinutes or pd.isna(maxSeasonMinutes):
+        maxSeasonMinutes = 1.0
+    #Keyed by ID rather than name: names are not guaranteed unique within a squad.
+    tieBreak = {
+        p: TIE_BREAK_EPSILON * (float(seasonMinutes.get(probsDF.loc[p, 'ID'], 0.0) or 0.0) / maxSeasonMinutes)
+        for p in players
+    }
+
+    # Role affinity: reward a slot whose base role is one SofaScore actually lists for the player.
+    # Settles ties between interchangeable slots by declared position rather than at random.
+    declaredRoles = {}
+    playedExactSlots = {}
+    for p in players:
+        parsed = parseDetailedPositions(probsDF.loc[p, 'Detailed Positions'])
+        declaredRoles[p] = {str(role) for role in parsed} if parsed else set()
+        playedExactSlots[p] = set(
+            allPlayersPlayedSlots.loc[allPlayersPlayedSlots['Player Name'] == probsDF.loc[p, 'Player Name'],
+                                      'Formation Slot'].dropna().unique()
+        )
+
+    def slotBonus(p, s):
+        bonus = ROLE_AFFINITY_BONUS if slotBaseRole(s) in declaredRoles[p] else 0.0
+        if s in playedExactSlots[p]:
+            bonus += SIDE_AFFINITY_BONUS
+        return bonus
+
+    # Objective: maximize starter probability weighted by position tier (module-level
+    # TIER_WEIGHTS, so the out-of-position cost is tunable and testable in one place), then
+    # role affinity, then season minutes — strictly decreasing scales, so each only ever
+    # decides what the one above it leaves exactly tied.
     prob += (
-        lpSum(TIER_WEIGHTS['primary']   * probsDF.loc[p, 'Starter Probability'] * assign[p, s] for p in players for s in primaryEligibility[p]   if (p, s) in assign) +
-        lpSum(TIER_WEIGHTS['secondary'] * probsDF.loc[p, 'Starter Probability'] * assign[p, s] for p in players for s in secondaryEligibility[p] if (p, s) in assign) +
-        lpSum(TIER_WEIGHTS['tertiary']  * probsDF.loc[p, 'Starter Probability'] * assign[p, s] for p in players for s in tertiaryEligibility[p]  if (p, s) in assign)
+        lpSum((TIER_WEIGHTS['primary']   * probsDF.loc[p, 'Starter Probability'] + slotBonus(p, s) + tieBreak[p]) * assign[p, s] for p in players for s in primaryEligibility[p]   if (p, s) in assign) +
+        lpSum((TIER_WEIGHTS['secondary'] * probsDF.loc[p, 'Starter Probability'] + slotBonus(p, s) + tieBreak[p]) * assign[p, s] for p in players for s in secondaryEligibility[p] if (p, s) in assign) +
+        lpSum((TIER_WEIGHTS['tertiary']  * probsDF.loc[p, 'Starter Probability'] + slotBonus(p, s) + tieBreak[p]) * assign[p, s] for p in players for s in tertiaryEligibility[p]  if (p, s) in assign)
     )
 
     # Each player fills at most one slot

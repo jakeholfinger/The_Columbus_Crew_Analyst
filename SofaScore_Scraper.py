@@ -30,20 +30,11 @@ def CreateFolderPath(previousFolderPath, folderName):
     return folderPath
 
 # %%
-def safe_request(url, headers, retries=3, delay=2):
-    for attempt in range(retries):
-        try:
-            response = requests.get(
-                url,
-                headers=headers,
-                impersonate='chrome120',
-                timeout=10
-            )
-            return response
-        except Exception as e:
-            print(f"Request failed (attempt {attempt+1}): {e}")
-            time.sleep(delay)
-    return None
+#Request plumbing (TLS fingerprint negotiation, safe_request, CheckedJSON) lives in
+#Request_Utils so every script that talks to SofaScore shares one implementation. Re-exported
+#here under the original names so the rest of this file reads unchanged.
+from Request_Utils import safe_request, CheckSiteAccess, CheckedJSON, NegotiateImpersonation
+import Request_Utils
 
 # %%
 def ScrapeStatistics(data, fullDataframe, firstHalfDataframe, secondHalfDataframe, count):
@@ -246,11 +237,14 @@ def ScrapeDataType(homeTeamMatchFolderPath, awayTeamMatchFolderPath, dataType, m
         print(f"Failed to get data from {apiURL}, skipping.")
         return ({}, {}) if dataType == '/lineups' else None
 
-    #Convert raw data (which is in bytes) into JSON file
-    try:
-        dataJSON = response.json()
-    except Exception as e:
-        print(f"Failed to parse JSON from {apiURL} ({e}), skipping.")
+    #Convert raw data (which is in bytes) into JSON file.
+    # CheckedJSON also rejects the error payload a challenge or rate-limit returns. Only 404
+    # was handled above, so any OTHER failure status still parsed into a perfectly valid dict
+    # and travelled on into the dataType branches, where it died on a missing key far from
+    # the request that actually went wrong (KeyError: 'home').
+    dataJSON = CheckedJSON(response)
+    if dataJSON is None:
+        print(f"Skipping {apiURL}.")
         return ({}, {}) if dataType == '/lineups' else None
 
     #Declare lists
@@ -353,6 +347,14 @@ def ScrapeDataType(homeTeamMatchFolderPath, awayTeamMatchFolderPath, dataType, m
         awayMissingRows = {}
         homeFormation = ['']
         awayFormation = ['']
+
+        # A 200 can still come back without the side keys — NCAA in particular publishes
+        # fixtures whose lineups never arrive. Writing three empty CSVs here would mark the
+        # folder complete and stop onlyScrapeIncompleteMatches from ever retrying it, so
+        # return empty and leave the match to be picked up on a later run.
+        if 'home' not in dataJSON or 'away' not in dataJSON:
+            print(f'No lineup data for match {matchID}, skipping.')
+            return {}, {}
 
         #Scrape player data
         ScrapePlayerStats(dataJSON['home'], homeRows, homeMissingRows, homeFormation)
@@ -488,7 +490,7 @@ def MatchHasEventData(matchID, headers, homePlayersIDs, awayPlayersIDs):
     #Construct api url
     apiURL = f'https://www.sofascore.com/api/v1/event/{matchID}'
     #Get data from api request
-    response = requests.get(apiURL, headers=headers, impersonate='chrome120')
+    response = requests.get(apiURL, headers=headers, impersonate=Request_Utils.CurrentProfile(headers))
     #Convert raw data (which is in bytes) into JSON file
     data = response.json()
     if data.get('event', {}).get('hasGlobalHighlights'):
@@ -669,7 +671,7 @@ def GetPlayersIDs(homePlayersIDs, awayPlayersIDs, matchID, headers):
     apiURL = f'https://www.sofascore.com/api/v1/event/{matchID}/lineups'
 
     #Get data from api request
-    #response = requests.get(apiURL, headers=headers, impersonate='chrome120')
+    #response = requests.get(apiURL, headers=headers, impersonate=Request_Utils.CurrentProfile(headers))
     response = safe_request(apiURL, headers)
     if response is None:
         return
@@ -795,7 +797,7 @@ def GetMatches(data, matchesDictionary, leagueID, seasonID, count):
     print('GetMatches')
     print(count)
     matchPageApiURL = f'https://www.sofascore.com/api/v1/unique-tournament/{leagueID}/season/{seasonID}/events/last/{count}'
-    for match in data.get('events'):
+    for match in (data.get('events') or []):
         matchData = {'Away Team Name': match.get('awayTeam', {}).get('name', ''),
                      'Away Team ID': match.get('awayTeam', {}).get('id', ''),
                      #Move to game characteristic data scraping?
@@ -833,10 +835,14 @@ def ScrapeSeasonData(leagueName, leagueID, seasonID, yearFolderPath, dataTypes, 
     matchesApiURL = f'https://www.sofascore.com/api/v1/unique-tournament/{leagueID}/season/{seasonID}/events/last/0'
 
     #Get data from api request
-    response = requests.get(matchesApiURL, headers=headers, impersonate='chrome120')
+    response = requests.get(matchesApiURL, headers=headers, impersonate=Request_Utils.CurrentProfile(headers))
 
     #Convert raw data (which is in bytes) into JSON file
-    dataJSON = response.json()
+    dataJSON = CheckedJSON(response)
+
+    if dataJSON is None:
+        print(f'Skipping {leagueName} {seasonID}: no usable response from the match list endpoint.')
+        return
 
     #Get all match api urls
     matchesDictionary = {}
@@ -848,11 +854,17 @@ def ScrapeSeasonData(leagueName, leagueID, seasonID, yearFolderPath, dataTypes, 
             #Construct api url
             matchesApiURL = f'https://www.sofascore.com/api/v1/unique-tournament/{leagueID}/season/{seasonID}/events/last/{count}'
             #Get data from api request
-            response = requests.get(matchesApiURL, headers=headers, impersonate='chrome120')
+            response = requests.get(matchesApiURL, headers=headers, impersonate=Request_Utils.CurrentProfile(headers))
             #Convert raw data (which is in bytes) into JSON file
-            dataJSON = response.json()
+            dataJSON = CheckedJSON(response)
 
-        GetMatches(dataJSON, matchesDictionary, leagueID, seasonID, count)
+            #A challenge mid-pagination would otherwise silently truncate the season.
+            if dataJSON is None:
+                print(f'Stopped paginating {leagueName} {seasonID} at page {count}; keeping the {len(matchesDictionary)} matches collected so far.')
+                break
+
+        if dataJSON is not None:
+            GetMatches(dataJSON, matchesDictionary, leagueID, seasonID, count)
 
     totalMatchesScraped[0] = len(matchesDictionary)
     numMatchesScraped = 0
@@ -912,7 +924,7 @@ def ScrapeLeaguesInfo(leagueDatabase, data, headers, numLeaguesInfoScraped):
             seasonsApiURL = f'https://www.sofascore.com/api/v1/unique-tournament/{leagueInfo.get("League ID")}/seasons'
 
             #Get data from api request
-            response = requests.get(seasonsApiURL, headers=headers, impersonate='chrome120')
+            response = requests.get(seasonsApiURL, headers=headers, impersonate=Request_Utils.CurrentProfile(headers))
 
             #Convert raw data (which is in bytes) into JSON file
             seasonsData = response.json()
@@ -986,21 +998,40 @@ def RunScraper(booleans, leagueNames, years, dataTypes):
     startTime = time.perf_counter()
 
     #Declare a header dictionary, which makes the bot look human and prevent 403 errors
+    # headers = {
+    #     'accept': '*/*',
+    #     'accept-language': 'en-US,en;q=0.9',
+    #     'cache-control': 'max-age=0',
+    #     'priority': 'u=1, i',
+    #     'referer': 'https://www.sofascore.com/',
+    #     'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
+    #     'sec-ch-ua-mobile': '?0',
+    #     'sec-ch-ua-platform': '"macOS"',
+    #     'sec-fetch-dest': 'empty',
+    #     'sec-fetch-mode': 'cors',
+    #     'sec-fetch-site': 'same-origin',
+    #     'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+    #     'x-requested-with': '5d7735',
+    #     #'If-Modified-Since': 'Sat, 14 Feb 2026 00:00:00 GMT'
+    # }
+
     headers = {
+        #No 'user-agent' or 'sec-ch-ua' here on purpose. SofaScore rejects stale Chrome
+        #UA strings outright: measured 2026-09-27 on an otherwise identical request,
+        #Chrome/149 got 200 while Chrome/144, /142 and /120 all got 403. Pinning a
+        #version just restarts that clock, and overriding the UA while curl_cffi
+        #impersonates a different browser is self-contradictory anyway. Leaving these
+        #out lets curl_cffi send the UA and client hints matching IMPERSONATE.
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9',
         'cache-control': 'max-age=0',
+        'if-none-match': 'W/"7c0a5170f5"',
         'priority': 'u=1, i',
-        'referer': 'https://www.sofascore.com/',
-        'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
+        'referer': 'https://www.sofascore.com',
         'sec-fetch-dest': 'empty',
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
-        'x-requested-with': '5d7735',
-        #'If-Modified-Since': 'Sat, 14 Feb 2026 00:00:00 GMT'
+        'x-requested-with': '72a46f',
     }
 
     #Initialize league and match counter
@@ -1009,6 +1040,10 @@ def RunScraper(booleans, leagueNames, years, dataTypes):
 
     #Define database path
     databasePath = '/Users/jakeholfinger/Desktop/CC Analyst/Data/SofaScore_Data/League_Database.csv'
+
+    #Fail in one request rather than thousands of matches into a run
+    if not CheckSiteAccess(headers):
+        return
 
     if booleans['scrapeLeaguesInfo'] or not os.path.exists(databasePath):
 
@@ -1033,7 +1068,7 @@ def RunScraper(booleans, leagueNames, years, dataTypes):
             matchesApiURL = f'https://www.sofascore.com/api/v1/sport/football/scheduled-tournaments/{currentDate}/page/{count}'
 
             #Get data from api request
-            response = requests.get(matchesApiURL, headers=headers, impersonate='chrome120')
+            response = requests.get(matchesApiURL, headers=headers, impersonate=Request_Utils.CurrentProfile(headers))
 
             #Convert raw data (which is in bytes) into JSON file
             data = response.json()
@@ -1047,7 +1082,7 @@ def RunScraper(booleans, leagueNames, years, dataTypes):
                     #Construct api url
                     matchesApiURL = f'https://www.sofascore.com/api/v1/sport/football/scheduled-tournaments/{currentDate}/page/{count}'
                     #Get data from api request
-                    response = requests.get(matchesApiURL, headers=headers, impersonate='chrome120')
+                    response = requests.get(matchesApiURL, headers=headers, impersonate=Request_Utils.CurrentProfile(headers))
                     #Convert raw data (which is in bytes) into JSON file
                     data = response.json()
 
@@ -1125,7 +1160,7 @@ booleans = {}
 booleans['overwriteMatchFiles'] = False
 
 #Determines whether only matches without all files should be scraped
-booleans['onlyScrapeIncompleteMatches'] = False
+booleans['onlyScrapeIncompleteMatches'] = True
 
 #Determines whether only new matches should be scraped (only scrapes games that don't have a folder)
 booleans['onlyScrapeNewMatches'] = False
@@ -1134,7 +1169,7 @@ booleans['onlyScrapeNewMatches'] = False
 booleans['deleteAllExtraFiles'] = False
 
 #Determines whether league info should be updated
-booleans['scrapeLeaguesInfo'] = True
+booleans['scrapeLeaguesInfo'] = False
 
 #Determines whether the leagues database should be cleared
 booleans['clearLeaguesDatabase'] = False
@@ -1146,8 +1181,10 @@ booleans['scrapeMatches'] = True
 
 #AllFileNames = ['Average_Positions.csv', 'First_Half_Team_Statistics.csv', 'Formations.csv', 'Full_Team_Statistics.csv', 'Match_Attributes.csv', 'Goalkeeper_Spatial_Points.csv', 'Match_Momentum.csv', 'Missing_Players.csv', 'Player_Event_Data.csv', 'Player_Heatmaps.csv', 'Player_Spatial_Points.csv', 'Player_Statistics.csv', 'Second_Half_Team_Statistics.csv', 'Shot_Map.csv', 'Subs_Average_Positions.csv']
 #leagueNames = ['MLS', 'Liga MX, Apertura', 'Leagues Cup', 'US Open Cup']
-#leagueNames = ['MLS']
-leagueNames = ['NCAA']
+#leagueNames = ['MLS', 'US Open Cup']
+#leagueNames = ['Canadian Championship']
+#leagueNames = ['MLS', 'Leagues Cup']
+leagueNames = ['MLS']
 #leagueNames = ['USL Championship', 'USL League One']
 
 #AllYears = ['2010', '2011', '2012', '2013', '2014', '2015', '2016', '2017, '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025', '2026']
